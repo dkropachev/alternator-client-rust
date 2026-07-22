@@ -30,10 +30,10 @@ pub fn hash(data: &[u8]) -> u64 {
     let mut h1: u64 = 0;
     let mut h2: u64 = 0;
 
-    let mut chunks = data.chunks_exact(16);
+    let (chunks, tail) = data.as_chunks::<16>();
 
     // Body - process 16-byte blocks
-    for chunk in chunks.by_ref() {
+    for chunk in chunks {
         // Read 8 bytes in little-endian order for k1 and k2
         let mut k1 = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
         let mut k2 = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
@@ -58,7 +58,6 @@ pub fn hash(data: &[u8]) -> u64 {
     }
 
     // Tail - handle remaining bytes
-    let tail = chunks.remainder();
     let mut k1: u64 = 0;
     let mut k2: u64 = 0;
 
