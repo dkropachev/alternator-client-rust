@@ -1,10 +1,23 @@
 COMPOSE := docker compose
+CARGO_HEATHER_VERSION := 0.3.0
 
 .PHONY: all
 all: static test down
 
 .PHONY: static
-static: fmt-check check clippy
+static: license-check fmt-check check clippy
+
+.PHONY: license-install
+license-install:
+	@command -v cargo-heather >/dev/null || cargo install cargo-heather --version $(CARGO_HEATHER_VERSION) --locked
+
+.PHONY: license-check
+license-check: license-install
+	cargo heather
+
+.PHONY: license-fix
+license-fix: license-install
+	cargo heather --fix
 
 .PHONY: fmt
 fmt:
