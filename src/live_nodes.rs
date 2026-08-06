@@ -141,9 +141,9 @@ impl LiveNodes {
         let mut seed_urls = seed_nodes
             .iter()
             .filter_map(|addr| {
-                let mut url = Url::parse(&format!("{}://{}", alternator_scheme, addr)).ok()?;
-                url.set_port(port).ok()?;
-                Some(Arc::new(url))
+                build_node_url(&alternator_scheme, addr, port)
+                    .ok()
+                    .map(Arc::new)
             })
             .collect::<Vec<_>>();
         seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -175,10 +175,7 @@ impl LiveNodes {
     }
 
     fn host_to_uri(&self, addr: &str) -> Result<Url, url::ParseError> {
-        let mut url = Url::parse(&format!("{}://{}", self.alternator_scheme, addr))?;
-        url.set_port(self.port)
-            .map_err(|()| url::ParseError::InvalidPort)?;
-        Ok(url)
+        build_node_url(&self.alternator_scheme, addr, self.port)
     }
 
     async fn fetch_live_nodes_for_scope(
@@ -403,6 +400,18 @@ impl LiveNodes {
     }
 }
 
+fn build_node_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
+    let authority = if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{addr}]")
+    } else {
+        addr.to_string()
+    };
+    let mut url = Url::parse(&format!("{scheme}://{authority}"))?;
+    url.set_port(port)
+        .map_err(|()| url::ParseError::InvalidPort)?;
+    Ok(url)
+}
+
 fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
     nodes.iter().any(|known| {
         known.host_str() == node.host_str()
@@ -424,6 +433,7 @@ impl Drop for LiveNodes {
 mod tests {
     use super::*;
     use crate::config::AlternatorConfig;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -435,8 +445,17 @@ mod tests {
     }
 
     async fn start_localnodes_server(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        start_localnodes_server_on("127.0.0.1:0", "localhost", body).await
+    }
+
+    async fn start_localnodes_server_on(
+        bind_address: &str,
+        expected_host: &str,
+        body: &'static str,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(bind_address).await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let expected_host = expected_host.to_string();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buffer = [0; 1024];
@@ -444,8 +463,8 @@ mod tests {
             let request = String::from_utf8_lossy(&buffer[..n]);
             assert!(request.starts_with("GET /localnodes HTTP/1.1"));
             assert!(
-                request.contains(&format!("host: localhost:{port}"))
-                    || request.contains(&format!("Host: localhost:{port}"))
+                request.contains(&format!("host: {expected_host}:{port}"))
+                    || request.contains(&format!("Host: {expected_host}:{port}"))
             );
 
             let response = format!(
@@ -512,6 +531,40 @@ mod tests {
         assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
     }
 
+    #[test]
+    fn raw_ipv6_seed_host_is_bracketed() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["::1"])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        assert_eq!(nodes.seed_urls[0].host_str(), Some("[::1]"));
+        assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
+    }
+
+    #[tokio::test]
+    async fn raw_ipv6_seed_discovers_raw_ipv6_node() {
+        let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["::1"])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        nodes.update_live_nodes().await;
+
+        server.await.unwrap();
+        assert_eq!(
+            nodes.live_nodes.load()[0].as_str(),
+            format!("http://[::1]:{port}/")
+        );
+    }
+
     #[tokio::test]
     async fn dns_entrypoint_discovers_dns_node_records() {
         let (port, server) = start_localnodes_server(r#"["localhost","node-a.internal"]"#).await;
@@ -565,5 +618,114 @@ mod tests {
                 ("node-b.internal".to_string(), Some(port)),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn dns_entrypoint_supports_single_family_and_cross_family_fallback() {
+        assert_dns_discovery("127.0.0.1:0", &[IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+        assert_dns_discovery("[::1]:0", &[IpAddr::V6(Ipv6Addr::LOCALHOST)]).await;
+        assert_dns_discovery(
+            "127.0.0.1:0",
+            &[
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        )
+        .await;
+        assert_dns_discovery(
+            "[::1]:0",
+            &[
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn all_unavailable_dns_records_return_without_clearing_seed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut nodes = dns_live_nodes(
+            port,
+            &[
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        );
+        Arc::get_mut(&mut nodes).unwrap().client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .connect_timeout(Duration::from_millis(100))
+            .resolve_to_addrs(
+                "dual.test",
+                &[
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                ],
+            )
+            .build()
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), nodes.update_live_nodes())
+            .await
+            .expect("discovery must not hang when both address families are unavailable");
+
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
+    }
+
+    #[tokio::test]
+    async fn refresh_recovers_through_original_raw_ipv6_seed() {
+        let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["::1"])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        nodes.live_nodes.store(Arc::new(vec![Arc::new(
+            Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
+        )]));
+
+        nodes.update_live_nodes().await;
+
+        server.await.unwrap();
+        assert_eq!(
+            nodes.live_nodes.load()[0].as_str(),
+            format!("http://[::1]:{port}/")
+        );
+    }
+
+    async fn assert_dns_discovery(bind_address: &str, resolved_ips: &[IpAddr]) {
+        let (port, server) =
+            start_localnodes_server_on(bind_address, "dual.test", r#"["dual.test"]"#).await;
+        let nodes = dns_live_nodes(port, resolved_ips);
+
+        nodes.update_live_nodes().await;
+
+        server.await.unwrap();
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
+    }
+
+    fn dns_live_nodes(port: u16, resolved_ips: &[IpAddr]) -> Arc<LiveNodes> {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["dual.test"])
+            .build();
+        let mut nodes = LiveNodes::new(&config).unwrap();
+        let addresses = resolved_ips
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, port))
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut nodes).unwrap().client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .connect_timeout(Duration::from_millis(500))
+            .resolve_to_addrs("dual.test", &addresses)
+            .build()
+            .unwrap();
+        nodes
     }
 }
