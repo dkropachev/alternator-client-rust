@@ -810,7 +810,8 @@ async fn primary_scope_recover_test() {
     assert_eq!(request_counter.get_posts_to_other_ips(&[ip]), 0);
 }
 
-// If a bad scope is given, the client should call only the seed node.
+// If a bad scope is given without a fallback, discovery keeps the seed for
+// later refreshes but removes it from application routing.
 #[tokio::test]
 #[cfg_attr(not(ccm_tests), ignore)]
 async fn bad_scope_test() {
@@ -822,19 +823,16 @@ async fn bad_scope_test() {
 
     let scope = RoutingScope::from_datacenter("fake_dc".to_string());
     let client = create_client_with_scope(cluster, scope.clone());
-    let n = 20;
-    make_n_calls(&client, n).await;
-    // With a bad scope, the client should call only the seed.
-    let seed_url = default_endpoint_url(cluster);
-    let seed_ip = seed_url
-        .strip_prefix("http://")
-        .unwrap()
-        .split(':')
-        .next()
-        .unwrap();
+    let live_nodes = client.config().live_nodes().unwrap().clone();
+    live_nodes.update_live_nodes().await;
+    assert!(live_nodes.get_live_nodes().is_empty());
 
-    assert!(request_counter.get_posts_to_ips(&[seed_ip]) >= n);
-    assert_eq!(request_counter.get_posts_to_other_ips(&[seed_ip]), 0);
+    request_counter.reset();
+    let n = 20;
+    for _ in 0..n {
+        assert!(client.list_tables().send().await.is_err());
+    }
+    assert_eq!(request_counter.total_posts(), 0);
 }
 
 // Check only if the restarted node gets requests from client.

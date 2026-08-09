@@ -37,23 +37,23 @@
 //!
 //! # Discovery mechanism
 //!
-//! Each refresh starts from the highest scope in the fallback chain, shuffles
-//! the current node list, and walks it as a candidate queue:
-//! - If a node responds with a non-empty list, the list is used as the new live nodes list,
-//!   and the refresh ends.
-//! - If a node responds with an empty list, it is put back at the end of the queue,
-//!   and the next node is tried, with the next fallback scope.
-//! - A network error causes the node to be dropped from the queue, but the next nodes are
-//!   tried with the same scope.
-//! - If the queue is exhausted without a successful response, it is populated with
-//!   the seed nodes, and the process repeats. If the seeds are exhausted without success, the refresh ends with no changes.
+//! Each scoped refresh starts from the highest scope in the fallback chain,
+//! shuffles the current node list, and then tries the original seed endpoints.
+//! A hostname is freshly resolved, and each unique resolved address is tried in
+//! order while the request URL retains the logical hostname. Transport errors,
+//! non-success responses, and malformed or unusable data advance to the next
+//! address and candidate. A configured fallback scope is considered only after
+//! all candidates return an empty list for the current scope.
 //!
 //! For cluster-wide scope, the refresh queries `/localnodes` from configured
 //! seed nodes and already-known live nodes, then unions the responses. To cover
 //! all datacenters, the initial configuration must include at least one working
 //! seed host from every datacenter that should receive traffic.
 //!
-//! Once it successfully gets a non-empty response, it atomically updates the [`live_nodes`] list using [`ArcSwap`].
+//! A non-empty successful result atomically replaces [`live_nodes`] using
+//! [`ArcSwap`]. A fully failed refresh preserves the previous snapshot and the
+//! original seeds. A conclusive empty scoped result removes seeds from routing
+//! while retaining them as future discovery candidates.
 //!
 //!  # Lifetime
 //!
@@ -96,15 +96,125 @@
 use crate::routing_scope::RoutingScope;
 use arc_swap::ArcSwap;
 use rand::seq::SliceRandom;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use url::Url;
+use url::{Host, Url};
 
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_RESOLVED_ADDRESSES: usize = 32;
+const MAX_CACHED_DISCOVERY_CLIENTS: usize = 64;
+const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_IN_FLIGHT_DNS_LOOKUPS: usize = 1;
+
+type ResolveFuture<'a> =
+    Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'a>>;
+
+trait DiscoveryResolver: std::fmt::Debug + Send + Sync {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a>;
+}
+
+#[derive(Debug)]
+struct SystemDiscoveryResolver;
+
+impl DiscoveryResolver for SystemDiscoveryResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
+    }
+}
+
+/// Keeps a timed-out OS resolver task alive behind its permit so later refreshes
+/// wait instead of creating an unbounded number of blocking DNS lookups.
+#[derive(Debug)]
+struct BoundedDiscoveryResolver {
+    inner: Arc<dyn DiscoveryResolver>,
+    lookup_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl BoundedDiscoveryResolver {
+    fn new(inner: Arc<dyn DiscoveryResolver>) -> Self {
+        Self {
+            inner,
+            lookup_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_LOOKUPS)),
+        }
+    }
+}
+
+impl DiscoveryResolver for BoundedDiscoveryResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        let host = host.to_string();
+        let inner = self.inner.clone();
+        let lookup_slots = self.lookup_slots.clone();
+        Box::pin(async move {
+            let permit = lookup_slots
+                .acquire_owned()
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let lookup = tokio::spawn(async move {
+                let _permit = permit;
+                inner.resolve(&host, port).await
+            });
+            lookup
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryClientCache {
+    clients: HashMap<(String, SocketAddr), reqwest::Client>,
+    insertion_order: VecDeque<(String, SocketAddr)>,
+    #[cfg(test)]
+    additional_root_certificate: Option<reqwest::Certificate>,
+}
+
+impl DiscoveryClientCache {
+    fn get_or_insert(
+        &mut self,
+        logical_host: &str,
+        address: SocketAddr,
+        is_domain: bool,
+    ) -> Option<reqwest::Client> {
+        let key = (logical_host.to_string(), address);
+        if let Some(client) = self.clients.get(&key) {
+            return Some(client.clone());
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .timeout(DISCOVERY_REQUEST_TIMEOUT)
+            .connect_timeout(DISCOVERY_CONNECT_TIMEOUT);
+        #[cfg(test)]
+        if let Some(certificate) = &self.additional_root_certificate {
+            builder = builder.add_root_certificate(certificate.clone());
+        }
+        if is_domain {
+            // Keep the configured hostname in the URL and override only the
+            // socket destination. This preserves HTTP Host and TLS server name.
+            builder = builder.resolve(logical_host, address);
+        }
+        let client = builder.build().ok()?;
+
+        while self.clients.len() >= MAX_CACHED_DISCOVERY_CLIENTS {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.clients.remove(&oldest);
+        }
+        self.insertion_order.push_back(key.clone());
+        self.clients.insert(key, client.clone());
+        Some(client)
+    }
+}
 
 #[derive(Debug)]
 pub struct LiveNodes {
@@ -116,7 +226,9 @@ pub struct LiveNodes {
     seed_urls: Vec<Arc<Url>>,
     alternator_scheme: String,
     port: Option<u16>,
-    client: reqwest::Client,
+    resolver: Arc<dyn DiscoveryResolver>,
+    discovery_clients: Mutex<DiscoveryClientCache>,
+    update_lock: tokio::sync::Mutex<()>,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
     bg_task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
@@ -151,12 +263,6 @@ impl LiveNodes {
             return None;
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .ok()?;
-
         Some(Arc::new(Self {
             routing_scope,
             active_interval,
@@ -166,7 +272,11 @@ impl LiveNodes {
             seed_urls,
             alternator_scheme,
             port,
-            client,
+            resolver: Arc::new(BoundedDiscoveryResolver::new(Arc::new(
+                SystemDiscoveryResolver,
+            ))),
+            discovery_clients: Mutex::new(DiscoveryClientCache::default()),
+            update_lock: tokio::sync::Mutex::new(()),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
             bg_task: std::sync::Mutex::new(None),
@@ -178,29 +288,121 @@ impl LiveNodes {
         build_node_url(&self.alternator_scheme, addr, self.port)
     }
 
+    async fn resolve_node_addresses(
+        &self,
+        node_addr: &Url,
+    ) -> Option<(String, bool, Vec<SocketAddr>)> {
+        let port = node_addr.port_or_known_default()?;
+        let (logical_host, is_domain, addresses) = match node_addr.host()? {
+            Host::Domain(host) => {
+                let addresses =
+                    tokio::time::timeout(DNS_LOOKUP_TIMEOUT, self.resolver.resolve(host, port))
+                        .await
+                        .ok()?
+                        .ok()?;
+                (host.to_string(), true, addresses)
+            }
+            Host::Ipv4(ip) => (
+                ip.to_string(),
+                false,
+                vec![SocketAddr::new(IpAddr::V4(ip), port)],
+            ),
+            Host::Ipv6(ip) => (
+                ip.to_string(),
+                false,
+                vec![SocketAddr::new(IpAddr::V6(ip), port)],
+            ),
+        };
+
+        let mut seen = HashSet::new();
+        let addresses = addresses
+            .into_iter()
+            .map(|address| SocketAddr::new(address.ip(), port))
+            .filter(|address| seen.insert(address.ip()))
+            .take(MAX_RESOLVED_ADDRESSES)
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return None;
+        }
+
+        Some((logical_host, is_domain, addresses))
+    }
+
+    fn discovery_client(
+        &self,
+        logical_host: &str,
+        address: SocketAddr,
+        is_domain: bool,
+    ) -> Option<reqwest::Client> {
+        self.discovery_clients
+            .lock()
+            .ok()?
+            .get_or_insert(logical_host, address, is_domain)
+    }
+
+    async fn read_bounded_response(mut response: reqwest::Response) -> Option<Vec<u8>> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_DISCOVERY_RESPONSE_BYTES as u64)
+        {
+            return None;
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if body.len().saturating_add(chunk.len()) > MAX_DISCOVERY_RESPONSE_BYTES {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Some(body)
+    }
+
     async fn fetch_live_nodes_for_scope(
         &self,
         scope: &RoutingScope,
         node_addr: &Url,
     ) -> Option<Vec<Arc<Url>>> {
         let url = scope.build_localnodes_url(node_addr.clone());
-        let mut nodes = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .ok()?
-            .json::<Vec<String>>()
-            .await
-            .ok()?;
+        let (logical_host, is_domain, addresses) = self.resolve_node_addresses(node_addr).await?;
+        let mut saw_empty_response = false;
 
-        nodes.sort();
-        Some(
-            nodes
+        for address in addresses {
+            let Some(client) = self.discovery_client(&logical_host, address, is_domain) else {
+                continue;
+            };
+            let Ok(response) = client.get(url.clone()).send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                // Drain normal error responses so a cached HTTP/1 connection can
+                // remain reusable on a later discovery cycle.
+                let _ = Self::read_bounded_response(response).await;
+                continue;
+            }
+            let Some(body) = Self::read_bounded_response(response).await else {
+                continue;
+            };
+            let Ok(nodes) = serde_json::from_slice::<Vec<String>>(&body) else {
+                continue;
+            };
+            if nodes.is_empty() {
+                saw_empty_response = true;
+                continue;
+            }
+
+            let mut valid_nodes = nodes
                 .into_iter()
                 .filter_map(|addr| self.host_to_uri(&addr).ok().map(Arc::new))
-                .collect(),
-        )
+                .collect::<Vec<_>>();
+            valid_nodes.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            valid_nodes.dedup_by(|left, right| left.as_str() == right.as_str());
+            if !valid_nodes.is_empty() {
+                return Some(valid_nodes);
+            }
+        }
+
+        saw_empty_response.then(Vec::new)
     }
 
     fn cluster_discovery_candidates(&self) -> Vec<Arc<Url>> {
@@ -209,6 +411,22 @@ impl LiveNodes {
         candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         candidates.dedup_by(|a, b| a.as_str() == b.as_str());
         candidates.shuffle(&mut rand::rng());
+        candidates
+    }
+
+    fn scoped_discovery_candidates(&self) -> Vec<Arc<Url>> {
+        let mut candidates = self.live_nodes.load().as_ref().clone();
+        candidates.shuffle(&mut rand::rng());
+
+        let mut seen = candidates
+            .iter()
+            .map(|candidate| candidate.as_str().to_string())
+            .collect::<HashSet<_>>();
+        for seed in &self.seed_urls {
+            if seen.insert(seed.as_str().to_string()) {
+                candidates.push(seed.clone());
+            }
+        }
         candidates
     }
 
@@ -237,6 +455,20 @@ impl LiveNodes {
         new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
         Some(new_nodes)
+    }
+
+    async fn discover_scoped_live_nodes(&self, scope: &RoutingScope) -> Option<Vec<Arc<Url>>> {
+        let mut saw_empty_response = false;
+
+        for node_addr in self.scoped_discovery_candidates() {
+            match self.fetch_live_nodes_for_scope(scope, &node_addr).await {
+                Some(nodes) if !nodes.is_empty() => return Some(nodes),
+                Some(_) => saw_empty_response = true,
+                None => {}
+            }
+        }
+
+        saw_empty_response.then(Vec::new)
     }
 
     /// Ensures the background discovery task is running.
@@ -343,57 +575,38 @@ impl LiveNodes {
     }
 
     pub async fn update_live_nodes(&self) {
+        let _update_guard = self.update_lock.lock().await;
         let mut scope = &self.routing_scope;
-        // Live nodes in a random order.
-        let mut nodes = self.live_nodes.load().as_ref().clone();
-        nodes.shuffle(&mut rand::rng());
-        let mut candidates: VecDeque<Arc<Url>> = nodes.into();
-        let mut using_seeds = false;
 
-        while let Some(node_addr) = candidates.pop_front() {
-            if scope.is_cluster() {
-                let Some(new_nodes) = self.discover_cluster_live_nodes().await else {
-                    return;
-                };
+        loop {
+            let result = if scope.is_cluster() {
+                self.discover_cluster_live_nodes().await
+            } else {
+                self.discover_scoped_live_nodes(scope).await
+            };
+            let Some(new_nodes) = result else {
+                // DNS, transport, and validation failures are not evidence that
+                // the previous learned snapshot is invalid.
+                return;
+            };
 
-                if new_nodes.is_empty() {
-                    let Some(fallback) = scope.fallback() else {
-                        return;
-                    };
-                    scope = fallback;
-                    candidates.push_back(node_addr);
-                    continue;
-                }
-
+            if !new_nodes.is_empty() {
                 if **self.live_nodes.load() != new_nodes {
                     self.live_nodes.store(Arc::new(new_nodes));
                 }
                 return;
             }
 
-            let result = self.fetch_live_nodes_for_scope(scope, &node_addr).await;
-
-            // Request failed: try the next candidate, or fall back to seeds.
-            let Some(new_nodes) = result else {
-                if candidates.is_empty() && !using_seeds {
-                    using_seeds = true;
-                    candidates = self.seed_urls.clone().into();
-                }
-                continue;
-            };
-
-            // Empty result: retry under a fallback scope if one exists.
-            if new_nodes.is_empty() {
-                let Some(fallback) = scope.fallback() else {
-                    return;
-                };
+            if let Some(fallback) = scope.fallback() {
                 scope = fallback;
-                candidates.push_back(node_addr);
                 continue;
             }
 
-            if **self.live_nodes.load() != new_nodes {
-                self.live_nodes.store(Arc::new(new_nodes));
+            // A scoped empty response conclusively means no node matches the
+            // requested scope. Keep seeds for discovery, but do not route
+            // application requests through an out-of-scope seed.
+            if !self.routing_scope.is_cluster() {
+                self.live_nodes.store(Arc::new(Vec::new()));
             }
             return;
         }
@@ -436,6 +649,274 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
+
+    #[derive(Debug)]
+    struct StaticResolver {
+        addresses: Vec<IpAddr>,
+    }
+
+    impl DiscoveryResolver for StaticResolver {
+        fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolveFuture<'a> {
+            let addresses = self
+                .addresses
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, port))
+                .collect();
+            Box::pin(async move { Ok(addresses) })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Resolution {
+        Addresses(Vec<IpAddr>),
+        Error(std::io::ErrorKind),
+        Pending,
+        Delayed {
+            addresses: Vec<IpAddr>,
+            release: Arc<Notify>,
+        },
+    }
+
+    #[derive(Debug)]
+    struct ScriptedResolver {
+        answers: Mutex<HashMap<String, VecDeque<Resolution>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedResolver {
+        fn new(entries: Vec<(&str, Vec<Resolution>)>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: Mutex::new(
+                    entries
+                        .into_iter()
+                        .map(|(host, answers)| (host.to_string(), answers.into()))
+                        .collect(),
+                ),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls_for(&self, host: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|called| called.as_str() == host)
+                .count()
+        }
+    }
+
+    impl DiscoveryResolver for ScriptedResolver {
+        fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+            self.calls.lock().unwrap().push(host.to_string());
+            let answer = self
+                .answers
+                .lock()
+                .unwrap()
+                .get_mut(host)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(Resolution::Error(std::io::ErrorKind::NotFound));
+
+            match answer {
+                Resolution::Addresses(addresses) => Box::pin(async move {
+                    Ok(addresses
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect())
+                }),
+                Resolution::Error(kind) => Box::pin(async move { Err(std::io::Error::from(kind)) }),
+                Resolution::Pending => Box::pin(std::future::pending()),
+                Resolution::Delayed { addresses, release } => Box::pin(async move {
+                    release.notified().await;
+                    Ok(addresses
+                        .into_iter()
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect())
+                }),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum ServerReply {
+        Http {
+            status: u16,
+            body: String,
+        },
+        Truncated(String),
+        OversizedDeclared,
+        OversizedChunked,
+        Stall,
+        Reset,
+        Delayed {
+            body: String,
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        },
+    }
+
+    #[derive(Debug)]
+    struct ExpectedReply {
+        path_and_query: String,
+        expected_host: Option<String>,
+        reply: ServerReply,
+    }
+
+    impl ExpectedReply {
+        fn json(body: impl Into<String>) -> Self {
+            Self::for_path(
+                "/localnodes",
+                ServerReply::Http {
+                    status: 200,
+                    body: body.into(),
+                },
+            )
+        }
+
+        fn for_path(path_and_query: impl Into<String>, reply: ServerReply) -> Self {
+            Self {
+                path_and_query: path_and_query.into(),
+                expected_host: None,
+                reply,
+            }
+        }
+
+        fn for_host(mut self, expected_host: impl Into<String>) -> Self {
+            self.expected_host = Some(expected_host.into());
+            self
+        }
+    }
+
+    async fn start_address_servers(
+        logical_host: &str,
+        specs: Vec<(Ipv4Addr, Vec<ExpectedReply>)>,
+    ) -> (u16, Vec<tokio::task::JoinHandle<()>>) {
+        let mut specs = specs.into_iter();
+        let (first_ip, first_replies) = specs.next().expect("at least one server");
+        let first_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(first_ip), 0))
+            .await
+            .unwrap();
+        let port = first_listener.local_addr().unwrap().port();
+        let mut listeners = vec![(first_listener, first_replies)];
+        for (ip, replies) in specs {
+            let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(ip), port))
+                .await
+                .unwrap();
+            listeners.push((listener, replies));
+        }
+
+        let handles = listeners
+            .into_iter()
+            .map(|(listener, replies)| {
+                let logical_host = logical_host.to_string();
+                tokio::spawn(async move {
+                    for expected in replies {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        loop {
+                            let mut chunk = [0; 1024];
+                            let count = stream.read(&mut chunk).await.unwrap();
+                            if count == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..count]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                            assert!(request.len() < 16 * 1024, "request headers too large");
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        assert!(request.starts_with(&format!(
+                            "GET {} HTTP/1.1",
+                            expected.path_and_query
+                        )));
+                        let expected_host = expected
+                            .expected_host
+                            .as_deref()
+                            .unwrap_or(&logical_host);
+                        assert!(request.to_ascii_lowercase().contains(&format!(
+                            "\r\nhost: {expected_host}:{port}\r\n"
+                        )));
+
+                        match expected.reply {
+                            ServerReply::Http { status, body } => {
+                                let response = format!(
+                                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                stream.write_all(response.as_bytes()).await.unwrap();
+                            }
+                            ServerReply::Truncated(body) => {
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len() + 16
+                                );
+                                stream.write_all(response.as_bytes()).await.unwrap();
+                            }
+                            ServerReply::OversizedDeclared => {
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    MAX_DISCOVERY_RESPONSE_BYTES + 1
+                                );
+                                stream.write_all(response.as_bytes()).await.unwrap();
+                            }
+                            ServerReply::OversizedChunked => {
+                                let body = vec![b'x'; MAX_DISCOVERY_RESPONSE_BYTES + 1];
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+                                    body.len()
+                                );
+                                if stream.write_all(header.as_bytes()).await.is_ok() {
+                                    let _ = stream.write_all(&body).await;
+                                }
+                            }
+                            ServerReply::Stall => {
+                                tokio::time::sleep(
+                                    DISCOVERY_REQUEST_TIMEOUT + Duration::from_millis(100),
+                                )
+                                .await;
+                            }
+                            ServerReply::Reset => {}
+                            ServerReply::Delayed {
+                                body,
+                                entered,
+                                release,
+                            } => {
+                                entered.notify_one();
+                                release.notified().await;
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                stream.write_all(response.as_bytes()).await.unwrap();
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        (port, handles)
+    }
+
+    async fn join_servers(handles: Vec<tokio::task::JoinHandle<()>>) {
+        for handle in handles {
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("server did not receive its expected requests")
+                .unwrap();
+        }
+    }
+
+    fn live_nodes_with_resolver(
+        config: &AlternatorConfig,
+        resolver: Arc<dyn DiscoveryResolver>,
+    ) -> Arc<LiveNodes> {
+        let mut nodes = LiveNodes::new(config).unwrap();
+        Arc::get_mut(&mut nodes).unwrap().resolver = resolver;
+        nodes
+    }
 
     fn test_config() -> AlternatorConfig {
         AlternatorConfig::builder()
@@ -643,30 +1124,809 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_address_fallback_rejects_unusable_localnodes_responses() {
+        let cases = vec![
+            (
+                "non-success",
+                ServerReply::Http {
+                    status: 503,
+                    body: r#"{"message":"busy"}"#.to_string(),
+                },
+            ),
+            (
+                "malformed-json",
+                ServerReply::Http {
+                    status: 200,
+                    body: "{".to_string(),
+                },
+            ),
+            (
+                "empty-list",
+                ServerReply::Http {
+                    status: 200,
+                    body: "[]".to_string(),
+                },
+            ),
+            (
+                "unusable-list",
+                ServerReply::Http {
+                    status: 200,
+                    body: r#"["[not-an-ip]",":"]"#.to_string(),
+                },
+            ),
+            (
+                "truncated-body",
+                ServerReply::Truncated(r#"["stale.internal"]"#.to_string()),
+            ),
+            ("oversized-declared-body", ServerReply::OversizedDeclared),
+            ("oversized-chunked-body", ServerReply::OversizedChunked),
+            ("transport-close", ServerReply::Reset),
+        ];
+
+        for (case, bad_reply) in cases {
+            let bad_ip = Ipv4Addr::new(127, 0, 0, 21);
+            let good_ip = Ipv4Addr::new(127, 0, 0, 22);
+            let (port, servers) = start_address_servers(
+                "entry.test",
+                vec![
+                    (
+                        bad_ip,
+                        vec![ExpectedReply::for_path("/localnodes", bad_reply)],
+                    ),
+                    (
+                        good_ip,
+                        vec![ExpectedReply::json(r#"["learned.internal"]"#)],
+                    ),
+                ],
+            )
+            .await;
+            let resolver = ScriptedResolver::new(vec![(
+                "entry.test",
+                vec![Resolution::Addresses(vec![
+                    IpAddr::V4(bad_ip),
+                    IpAddr::V4(good_ip),
+                ])],
+            )]);
+            let config = AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme("http")
+                .port(port)
+                .seed_hosts(["entry.test"])
+                .build();
+            let nodes = live_nodes_with_resolver(&config, resolver);
+
+            nodes.update_live_nodes().await;
+            join_servers(servers).await;
+
+            assert_eq!(
+                nodes.live_nodes.load()[0].host_str(),
+                Some("learned.internal"),
+                "case {case} did not use the later valid address"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn several_leading_and_duplicate_dns_addresses_receive_bounded_attempts() {
+        let first_bad = Ipv4Addr::new(127, 0, 0, 31);
+        let second_bad = Ipv4Addr::new(127, 0, 0, 32);
+        let good = Ipv4Addr::new(127, 0, 0, 33);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![
+                (
+                    first_bad,
+                    vec![ExpectedReply::for_path(
+                        "/localnodes",
+                        ServerReply::Http {
+                            status: 500,
+                            body: "temporary".to_string(),
+                        },
+                    )],
+                ),
+                (second_bad, vec![ExpectedReply::json("not-json")]),
+                (good, vec![ExpectedReply::json(r#"["learned.internal"]"#)]),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![
+                IpAddr::V4(first_bad),
+                IpAddr::V4(first_bad),
+                IpAddr::V4(second_bad),
+                IpAddr::V4(good),
+                IpAddr::V4(good),
+            ])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("learned.internal")
+        );
+        assert_eq!(resolver.calls_for("entry.test"), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_localnodes_data_keeps_valid_unique_entries() {
+        let address = Ipv4Addr::new(127, 0, 0, 34);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                address,
+                vec![ExpectedReply::json(
+                    r#"["[not-an-ip]","learned.internal",":","learned.internal"]"#,
+                )],
+            )],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![IpAddr::V4(address)])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        let snapshot = nodes.live_nodes.load();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].host_str(), Some("learned.internal"));
+    }
+
+    #[tokio::test]
+    async fn address_fallback_preserves_https_server_name_and_host_header() {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["entry.test".to_string()]).unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    server_cert.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+        let address = Ipv4Addr::new(127, 0, 0, 36);
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(address), 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut request = [0; 2048];
+            let count = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+            assert!(request.starts_with("get /localnodes http/1.1"));
+            assert!(request.contains(&format!("\r\nhost: entry.test:{port}\r\n")));
+            let body = r#"["learned.internal"]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![IpAddr::V4(address)])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("https")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+        nodes
+            .discovery_clients
+            .lock()
+            .unwrap()
+            .additional_root_certificate =
+            Some(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap());
+
+        nodes.update_live_nodes().await;
+        server.await.unwrap();
+
+        let snapshot = nodes.live_nodes.load();
+        assert_eq!(snapshot[0].scheme(), "https");
+        assert_eq!(snapshot[0].host_str(), Some("learned.internal"));
+        assert_eq!(snapshot[0].port(), Some(port));
+    }
+
+    #[tokio::test]
+    async fn wholly_invalid_scoped_data_preserves_the_previous_snapshot() {
+        let address = Ipv4Addr::new(127, 0, 0, 35);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                address,
+                vec![ExpectedReply::for_path(
+                    "/localnodes?dc=dc1",
+                    ServerReply::Http {
+                        status: 200,
+                        body: r#"["[not-an-ip]",":"]"#.to_string(),
+                    },
+                )],
+            )],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![IpAddr::V4(address)])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("entry.test"));
+    }
+
+    #[tokio::test]
+    async fn dns_errors_and_empty_answers_recover_on_later_resolution() {
+        let address = Ipv4Addr::new(127, 0, 0, 41);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                address,
+                vec![ExpectedReply::json(r#"["learned.internal"]"#)],
+            )],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![
+                Resolution::Error(std::io::ErrorKind::NotFound),
+                Resolution::Addresses(Vec::new()),
+                Resolution::Addresses(vec![IpAddr::V4(address)]),
+            ],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("entry.test"));
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("entry.test"));
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("learned.internal")
+        );
+        assert_eq!(resolver.calls_for("entry.test"), 3);
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_timeout_is_bounded_and_preserves_seed() {
+        let resolver = ScriptedResolver::new(vec![("entry.test", vec![Resolution::Pending])]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+        let started = Instant::now();
+
+        tokio::time::timeout(Duration::from_secs(3), nodes.update_live_nodes())
+            .await
+            .expect("DNS timeout must bound the refresh");
+
+        assert!(started.elapsed() >= DNS_LOOKUP_TIMEOUT);
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("entry.test"));
+    }
+
+    #[tokio::test]
+    async fn stalled_dns_lookup_does_not_spawn_unbounded_resolver_tasks() {
+        let address = Ipv4Addr::new(127, 0, 0, 40);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                address,
+                vec![ExpectedReply::json(r#"["learned.internal"]"#)],
+            )],
+        )
+        .await;
+        let release = Arc::new(Notify::new());
+        let inner = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![
+                Resolution::Delayed {
+                    addresses: Vec::new(),
+                    release: release.clone(),
+                },
+                Resolution::Addresses(vec![IpAddr::V4(address)]),
+            ],
+        )]);
+        let resolver: Arc<dyn DiscoveryResolver> =
+            Arc::new(BoundedDiscoveryResolver::new(inner.clone()));
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        nodes.update_live_nodes().await;
+        assert_eq!(inner.calls_for("entry.test"), MAX_IN_FLIGHT_DNS_LOOKUPS);
+
+        let second_nodes = nodes.clone();
+        let second = tokio::spawn(async move { second_nodes.update_live_nodes().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            inner.calls_for("entry.test"),
+            MAX_IN_FLIGHT_DNS_LOOKUPS,
+            "a second OS lookup must wait behind the timed-out lookup"
+        );
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("refresh should resume when the stalled lookup finishes")
+            .unwrap();
+        join_servers(servers).await;
+
+        assert_eq!(inner.calls_for("entry.test"), 2);
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("learned.internal")
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_address_times_out_then_later_address_succeeds() {
+        let stalled_address = Ipv4Addr::new(127, 0, 0, 53);
+        let good_address = Ipv4Addr::new(127, 0, 0, 54);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![
+                (
+                    stalled_address,
+                    vec![ExpectedReply::for_path("/localnodes", ServerReply::Stall)],
+                ),
+                (
+                    good_address,
+                    vec![ExpectedReply::json(r#"["learned.internal"]"#)],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![
+                IpAddr::V4(stalled_address),
+                IpAddr::V4(good_address),
+            ])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+        let started = Instant::now();
+
+        tokio::time::timeout(
+            DISCOVERY_REQUEST_TIMEOUT + Duration::from_secs(2),
+            nodes.update_live_nodes(),
+        )
+        .await
+        .expect("per-address timeout must advance to the next address");
+        join_servers(servers).await;
+
+        assert!(started.elapsed() >= DISCOVERY_REQUEST_TIMEOUT);
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("learned.internal")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_active_refresh_retains_nodes_then_reresolves_seed_for_recovery() {
+        let first_address = Ipv4Addr::new(127, 0, 0, 42);
+        let recovered_address = Ipv4Addr::new(127, 0, 0, 43);
+        let unavailable_address = Ipv4Addr::new(127, 0, 0, 44);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![
+                (
+                    first_address,
+                    vec![ExpectedReply::json(r#"["old-node.test"]"#)],
+                ),
+                (
+                    recovered_address,
+                    vec![ExpectedReply::json(r#"["new-node.test"]"#)],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![
+            (
+                "entry.test",
+                vec![
+                    Resolution::Addresses(vec![IpAddr::V4(first_address)]),
+                    Resolution::Error(std::io::ErrorKind::NotFound),
+                    Resolution::Addresses(vec![IpAddr::V4(recovered_address)]),
+                ],
+            ),
+            (
+                "old-node.test",
+                vec![
+                    Resolution::Addresses(vec![IpAddr::V4(unavailable_address)]),
+                    Resolution::Addresses(vec![IpAddr::V4(unavailable_address)]),
+                ],
+            ),
+        ]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("old-node.test"));
+
+        nodes.update_live_nodes().await;
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("old-node.test"),
+            "a fully failed refresh must retain the last valid snapshot"
+        );
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("new-node.test"));
+        assert_eq!(resolver.calls_for("entry.test"), 3);
+
+        nodes.discovery_started.store(true, Ordering::Release);
+        let routed = nodes
+            .get_next_node_round_robin(&HashSet::new())
+            .expect("recovered node should be routable");
+        assert_eq!(routed.host_str(), Some("new-node.test"));
+    }
+
+    #[tokio::test]
+    async fn partial_scoped_failure_uses_reachable_learned_node_without_seed() {
+        let live_address = Ipv4Addr::new(127, 0, 0, 45);
+        let unavailable_address = Ipv4Addr::new(127, 0, 0, 46);
+        let (port, servers) = start_address_servers(
+            "live-node.test",
+            vec![(
+                live_address,
+                vec![ExpectedReply::for_path(
+                    "/localnodes?dc=dc1",
+                    ServerReply::Http {
+                        status: 200,
+                        body: r#"["live-node.test"]"#.to_string(),
+                    },
+                )],
+            )],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![
+            (
+                "dead-node.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(unavailable_address)])],
+            ),
+            (
+                "live-node.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(live_address)])],
+            ),
+        ]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+        nodes.live_nodes.store(Arc::new(vec![
+            Arc::new(Url::parse(&format!("http://dead-node.test:{port}/")).unwrap()),
+            Arc::new(Url::parse(&format!("http://live-node.test:{port}/")).unwrap()),
+        ]));
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("live-node.test")
+        );
+        assert_eq!(resolver.calls_for("entry.test"), 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_scope_without_fallback_removes_seed_from_routing() {
+        let address = Ipv4Addr::new(127, 0, 0, 47);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                address,
+                vec![ExpectedReply::for_path(
+                    "/localnodes?dc=missing",
+                    ServerReply::Http {
+                        status: 200,
+                        body: "[]".to_string(),
+                    },
+                )],
+            )],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![IpAddr::V4(address)])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .routing_scope(RoutingScope::from_datacenter("missing".to_string()))
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert!(nodes.live_nodes.load().is_empty());
+        assert_eq!(nodes.seed_urls[0].host_str(), Some("entry.test"));
+        nodes.discovery_started.store(true, Ordering::Release);
+        assert!(nodes.get_next_node_round_robin(&HashSet::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_scope_uses_configured_fallback_scope() {
+        let address = Ipv4Addr::new(127, 0, 0, 48);
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                address,
+                vec![
+                    ExpectedReply::for_path(
+                        "/localnodes?dc=missing",
+                        ServerReply::Http {
+                            status: 200,
+                            body: "[]".to_string(),
+                        },
+                    ),
+                    ExpectedReply::json(r#"["fallback-node.test"]"#),
+                ],
+            )],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![
+                Resolution::Addresses(vec![IpAddr::V4(address)]),
+                Resolution::Addresses(vec![IpAddr::V4(address)]),
+            ],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .routing_scope(
+                RoutingScope::from_datacenter("missing".to_string())
+                    .with_fallback(RoutingScope::from_cluster()),
+            )
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("fallback-node.test")
+        );
+        assert_eq!(resolver.calls_for("entry.test"), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_first_seed_does_not_block_another_configured_seed() {
+        let invalid_address = Ipv4Addr::new(127, 0, 0, 49);
+        let valid_address = Ipv4Addr::new(127, 0, 0, 50);
+        let (port, servers) = start_address_servers(
+            "unused.test",
+            vec![
+                (
+                    invalid_address,
+                    vec![ExpectedReply::json("not-json").for_host("seed-a.test")],
+                ),
+                (
+                    valid_address,
+                    vec![ExpectedReply::json(r#"["learned.internal"]"#).for_host("seed-b.test")],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![
+            (
+                "seed-a.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(invalid_address)])],
+            ),
+            (
+                "seed-b.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(valid_address)])],
+            ),
+        ]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["seed-a.test", "seed-b.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("learned.internal")
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_refreshes_are_serialized_and_publish_complete_snapshots() {
+        let first_address = Ipv4Addr::new(127, 0, 0, 51);
+        let second_address = Ipv4Addr::new(127, 0, 0, 52);
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![
+                (
+                    first_address,
+                    vec![ExpectedReply::for_path(
+                        "/localnodes",
+                        ServerReply::Delayed {
+                            body: r#"["entry.test"]"#.to_string(),
+                            entered: entered.clone(),
+                            release: release.clone(),
+                        },
+                    )],
+                ),
+                (
+                    second_address,
+                    vec![ExpectedReply::json(r#"["new-node.test"]"#)],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![
+                Resolution::Addresses(vec![IpAddr::V4(first_address)]),
+                Resolution::Addresses(vec![IpAddr::V4(second_address)]),
+            ],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+
+        let first_nodes = nodes.clone();
+        let first = tokio::spawn(async move { first_nodes.update_live_nodes().await });
+        entered.notified().await;
+        let second_nodes = nodes.clone();
+        let second = tokio::spawn(async move { second_nodes.update_live_nodes().await });
+        tokio::task::yield_now().await;
+
+        assert_eq!(resolver.calls_for("entry.test"), 1);
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("entry.test"));
+        release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        join_servers(servers).await;
+
+        assert_eq!(nodes.live_nodes.load().len(), 1);
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("new-node.test"));
+    }
+
+    #[tokio::test]
+    async fn resolved_address_list_is_deduplicated_and_capped() {
+        let unique_addresses = (1..=40)
+            .map(|last| IpAddr::V4(Ipv4Addr::new(127, 1, 0, last)))
+            .collect::<Vec<_>>();
+        let mut answers = unique_addresses.clone();
+        answers.splice(1..1, [unique_addresses[0], unique_addresses[0]]);
+        let resolver =
+            ScriptedResolver::new(vec![("entry.test", vec![Resolution::Addresses(answers)])]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        let (_, _, addresses) = nodes
+            .resolve_node_addresses(&nodes.seed_urls[0])
+            .await
+            .unwrap();
+
+        assert_eq!(addresses.len(), MAX_RESOLVED_ADDRESSES);
+        assert_eq!(addresses[0].ip(), unique_addresses[0]);
+        assert_eq!(addresses[1].ip(), unique_addresses[1]);
+    }
+
+    #[test]
+    fn discovery_client_cache_is_bounded() {
+        let mut cache = DiscoveryClientCache::default();
+        for last in 1..=(MAX_CACHED_DISCOVERY_CLIENTS + 10) {
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 2, 0, last as u8)), 8000);
+            cache
+                .get_or_insert(&format!("entry-{last}.test"), address, true)
+                .unwrap();
+        }
+
+        assert_eq!(cache.clients.len(), MAX_CACHED_DISCOVERY_CLIENTS);
+        assert_eq!(cache.insertion_order.len(), MAX_CACHED_DISCOVERY_CLIENTS);
+    }
+
+    #[tokio::test]
     async fn all_unavailable_dns_records_return_without_clearing_seed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let mut nodes = dns_live_nodes(
+        let nodes = dns_live_nodes(
             port,
             &[
                 IpAddr::V6(Ipv6Addr::LOCALHOST),
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
             ],
         );
-        Arc::get_mut(&mut nodes).unwrap().client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(200))
-            .connect_timeout(Duration::from_millis(100))
-            .resolve_to_addrs(
-                "dual.test",
-                &[
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-                ],
-            )
-            .build()
-            .unwrap();
-
         tokio::time::timeout(Duration::from_secs(1), nodes.update_live_nodes())
             .await
             .expect("discovery must not hang when both address families are unavailable");
@@ -716,16 +1976,9 @@ mod tests {
             .seed_hosts(["dual.test"])
             .build();
         let mut nodes = LiveNodes::new(&config).unwrap();
-        let addresses = resolved_ips
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, port))
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut nodes).unwrap().client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
-            .connect_timeout(Duration::from_millis(500))
-            .resolve_to_addrs("dual.test", &addresses)
-            .build()
-            .unwrap();
+        Arc::get_mut(&mut nodes).unwrap().resolver = Arc::new(StaticResolver {
+            addresses: resolved_ips.to_vec(),
+        });
         nodes
     }
 }
