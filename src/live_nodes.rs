@@ -22,7 +22,8 @@
 //! nodes in a random order to get an updated list of live nodes. After a
 //! successful refresh, the list is updated to nodes from the highest available
 //! scope in the fallback chain provided by the user.
-//! Underneath it uses a basic [`reqwest::Client`] with timeouts.
+//! Underneath it uses a basic [`reqwest::Client`] with timeouts, redirects and
+//! environment proxies disabled, and strict per-address socket overrides.
 //!
 //! # Polling cadence
 //!
@@ -44,6 +45,10 @@
 //! non-success responses, and malformed or unusable data advance to the next
 //! address and candidate. A configured fallback scope is considered only after
 //! all candidates return an empty list for the current scope.
+//! A refresh is capped at 30 seconds, 64 candidates, 32 socket addresses per
+//! hostname, and 256 parsed topology nodes. The original seed set is capped at
+//! 16 entries. DNS work is globally limited to eight coalesced in-flight
+//! lookups so a stalled hostname cannot create unbounded resolver tasks.
 //!
 //! For cluster-wide scope, the refresh queries `/localnodes` from configured
 //! seed nodes and already-known live nodes, then unions the responses. To cover
@@ -52,14 +57,16 @@
 //!
 //! A non-empty successful result atomically replaces [`live_nodes`] using
 //! [`ArcSwap`]. A fully failed refresh preserves the previous snapshot and the
-//! original seeds. A conclusive empty scoped result removes seeds from routing
-//! while retaining them as future discovery candidates.
+//! original seeds. Non-cluster seeds are discovery-only until a scoped or
+//! fallback response validates a routing snapshot. A conclusive empty scoped
+//! result retains the empty routing snapshot and the seeds as future discovery
+//! candidates.
 //!
 //!  # Lifetime
 //!
-//! The background task holds a [`Weak`] reference to its [`LiveNodes`], so it
-//! terminates on its own once the last external [`Arc`] is dropped. [`Drop`]
-//! additionally aborts the task to avoid waiting out the current sleep.
+//! The background task owns only cloned refresh state, not [`LiveNodes`]. This
+//! lets [`Drop`] run as soon as the last external [`Arc`] is released and abort
+//! an in-progress refresh without waiting for network timeouts.
 //!
 //! # Start-up
 //!
@@ -80,7 +87,6 @@
 //! [`RoutingScope`]: crate::routing_scope::RoutingScope
 //! [`ArcSwap`]: arc_swap::ArcSwap
 //! [`Notify`]: tokio::sync::Notify
-//! [`Weak`]: std::sync::Weak
 //! [`Arc`]: std::sync::Arc
 //! [`active_interval`]: LiveNodes::active_interval
 //! [`idle_interval`]: LiveNodes::idle_interval
@@ -96,12 +102,15 @@
 use crate::routing_scope::RoutingScope;
 use arc_swap::ArcSwap;
 use rand::seq::SliceRandom;
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use url::{Host, Url};
@@ -111,10 +120,14 @@ const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCOVERY_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SEED_NODES: usize = 16;
 const MAX_RESOLVED_ADDRESSES: usize = 32;
+const MAX_DISCOVERY_CANDIDATES: usize = 64;
+const MAX_DISCOVERED_NODES: usize = 256;
 const MAX_CACHED_DISCOVERY_CLIENTS: usize = 64;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_IN_FLIGHT_DNS_LOOKUPS: usize = 1;
+const MAX_IN_FLIGHT_DNS_LOOKUPS: usize = 8;
 
 type ResolveFuture<'a> =
     Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'a>>;
@@ -132,20 +145,155 @@ impl DiscoveryResolver for SystemDiscoveryResolver {
     }
 }
 
-/// Keeps a timed-out OS resolver task alive behind its permit so later refreshes
-/// wait instead of creating an unbounded number of blocking DNS lookups.
+#[derive(Clone, Debug)]
+enum SharedLookupResult {
+    Addresses(Vec<SocketAddr>),
+    Error {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl SharedLookupResult {
+    fn from_io_result(result: std::io::Result<Vec<SocketAddr>>) -> Self {
+        match result {
+            Ok(addresses) => Self::Addresses(addresses),
+            Err(error) => Self::Error {
+                kind: error.kind(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn into_io_result(self) -> std::io::Result<Vec<SocketAddr>> {
+        match self {
+            Self::Addresses(addresses) => Ok(addresses),
+            Self::Error { kind, message } => Err(std::io::Error::new(kind, message)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InFlightLookup {
+    result: tokio::sync::watch::Sender<Option<SharedLookupResult>>,
+}
+
+impl InFlightLookup {
+    fn new() -> Self {
+        let (result, _receiver) = tokio::sync::watch::channel(None);
+        Self { result }
+    }
+
+    fn complete(&self, result: SharedLookupResult) {
+        self.result.send_replace(Some(result));
+    }
+
+    async fn wait(&self) -> std::io::Result<Vec<SocketAddr>> {
+        let mut result = self.result.subscribe();
+        loop {
+            if let Some(result) = result.borrow().clone() {
+                return result.into_io_result();
+            }
+            result.changed().await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "DNS lookup result channel closed",
+                )
+            })?;
+        }
+    }
+}
+
+type LookupKey = (String, u16);
+
+#[derive(Debug)]
+struct BoundedResolverState {
+    lookup_slots: Arc<tokio::sync::Semaphore>,
+    in_flight: Mutex<HashMap<LookupKey, Arc<InFlightLookup>>>,
+    peak_in_flight: AtomicUsize,
+}
+
+impl BoundedResolverState {
+    fn new() -> Self {
+        Self {
+            lookup_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_LOOKUPS)),
+            in_flight: Mutex::new(HashMap::new()),
+            peak_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn register(self: &Arc<Self>, key: LookupKey) -> std::io::Result<(Arc<InFlightLookup>, bool)> {
+        let mut in_flight = self.in_flight.lock().unwrap();
+        if let Some(lookup) = in_flight.get(&key) {
+            return Ok((lookup.clone(), false));
+        }
+        if in_flight.len() >= MAX_IN_FLIGHT_DNS_LOOKUPS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "DNS lookup capacity exhausted",
+            ));
+        }
+
+        let lookup = Arc::new(InFlightLookup::new());
+        in_flight.insert(key, lookup.clone());
+        self.peak_in_flight
+            .fetch_max(in_flight.len(), Ordering::Relaxed);
+        Ok((lookup, true))
+    }
+}
+
+struct LookupRegistration {
+    state: Weak<BoundedResolverState>,
+    key: LookupKey,
+    lookup: Arc<InFlightLookup>,
+}
+
+impl Drop for LookupRegistration {
+    fn drop(&mut self) {
+        let incomplete = self.lookup.result.borrow().is_none();
+        if let Some(state) = self.state.upgrade() {
+            let mut in_flight = state.in_flight.lock().unwrap();
+            if in_flight
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.lookup))
+            {
+                in_flight.remove(&self.key);
+            }
+        }
+        if incomplete {
+            self.lookup.complete(SharedLookupResult::Error {
+                kind: std::io::ErrorKind::Interrupted,
+                message: "DNS lookup task was cancelled".to_string(),
+            });
+        }
+    }
+}
+
+/// Coalesces lookups for the same hostname while allowing unrelated hostnames
+/// to progress through a small shared worker budget. Timed-out callers do not
+/// cancel or duplicate the underlying OS resolver work.
 #[derive(Debug)]
 struct BoundedDiscoveryResolver {
     inner: Arc<dyn DiscoveryResolver>,
-    lookup_slots: Arc<tokio::sync::Semaphore>,
+    state: Arc<BoundedResolverState>,
 }
 
 impl BoundedDiscoveryResolver {
     fn new(inner: Arc<dyn DiscoveryResolver>) -> Self {
         Self {
             inner,
-            lookup_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_DNS_LOOKUPS)),
+            state: Arc::new(BoundedResolverState::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn in_flight_count(&self) -> usize {
+        self.state.in_flight.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn peak_in_flight_count(&self) -> usize {
+        self.state.peak_in_flight.load(Ordering::Relaxed)
     }
 }
 
@@ -153,21 +301,51 @@ impl DiscoveryResolver for BoundedDiscoveryResolver {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
         let host = host.to_string();
         let inner = self.inner.clone();
-        let lookup_slots = self.lookup_slots.clone();
+        let state = self.state.clone();
         Box::pin(async move {
-            let permit = lookup_slots
-                .acquire_owned()
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let lookup = tokio::spawn(async move {
-                let _permit = permit;
-                inner.resolve(&host, port).await
-            });
-            lookup
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))?
+            let key = (host.clone(), port);
+            let (lookup, should_spawn) = state.register(key.clone())?;
+            if should_spawn {
+                let task_lookup = lookup.clone();
+                let task_state = state.clone();
+                tokio::spawn(async move {
+                    let _registration = LookupRegistration {
+                        state: Arc::downgrade(&task_state),
+                        key,
+                        lookup: task_lookup.clone(),
+                    };
+                    let Ok(_permit) = task_state.lookup_slots.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let result =
+                        SharedLookupResult::from_io_result(inner.resolve(&host, port).await);
+                    drop(_permit);
+                    {
+                        let mut in_flight = task_state.in_flight.lock().unwrap();
+                        task_lookup.complete(result);
+                        if in_flight
+                            .get(&_registration.key)
+                            .is_some_and(|current| Arc::ptr_eq(current, &task_lookup))
+                        {
+                            in_flight.remove(&_registration.key);
+                        }
+                    }
+                });
+            }
+            lookup.wait().await
         })
     }
+}
+
+fn system_discovery_resolver() -> Arc<dyn DiscoveryResolver> {
+    static RESOLVER: OnceLock<Arc<BoundedDiscoveryResolver>> = OnceLock::new();
+    RESOLVER
+        .get_or_init(|| {
+            Arc::new(BoundedDiscoveryResolver::new(Arc::new(
+                SystemDiscoveryResolver,
+            )))
+        })
+        .clone()
 }
 
 #[derive(Debug, Default)]
@@ -192,7 +370,11 @@ impl DiscoveryClientCache {
 
         let mut builder = reqwest::Client::builder()
             .timeout(DISCOVERY_REQUEST_TIMEOUT)
-            .connect_timeout(DISCOVERY_CONNECT_TIMEOUT);
+            .connect_timeout(DISCOVERY_CONNECT_TIMEOUT)
+            // Discovery must use exactly the selected DNS socket. Following a
+            // redirect or an environment proxy would escape address fallback.
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
         #[cfg(test)]
         if let Some(certificate) = &self.additional_root_certificate {
             builder = builder.add_root_certificate(certificate.clone());
@@ -216,19 +398,74 @@ impl DiscoveryClientCache {
     }
 }
 
+struct BoundedNodeList(Vec<String>);
+
+impl<'de> Deserialize<'de> for BoundedNodeList {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NodeListVisitor;
+
+        impl<'de> Visitor<'de> for NodeListVisitor {
+            type Value = BoundedNodeList;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    formatter,
+                    "an array containing at most {MAX_DISCOVERED_NODES} node addresses"
+                )
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut nodes = Vec::with_capacity(
+                    sequence
+                        .size_hint()
+                        .unwrap_or_default()
+                        .min(MAX_DISCOVERED_NODES),
+                );
+                while let Some(node) = sequence.next_element::<String>()? {
+                    if nodes.len() >= MAX_DISCOVERED_NODES {
+                        return Err(A::Error::custom("discovered node limit exceeded"));
+                    }
+                    nodes.push(node);
+                }
+                Ok(BoundedNodeList(nodes))
+            }
+        }
+
+        deserializer.deserialize_seq(NodeListVisitor)
+    }
+}
+
+#[derive(Clone)]
+struct DiscoveryRefresh {
+    routing_scope: RoutingScope,
+    live_nodes: Arc<ArcSwap<Vec<Arc<Url>>>>,
+    seed_urls: Arc<Vec<Arc<Url>>>,
+    alternator_scheme: String,
+    port: Option<u16>,
+    resolver: Arc<dyn DiscoveryResolver>,
+    discovery_clients: Arc<Mutex<DiscoveryClientCache>>,
+    update_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
 #[derive(Debug)]
 pub struct LiveNodes {
     routing_scope: RoutingScope,
     active_interval: Duration,
     idle_interval: Duration,
     counter: Arc<AtomicUsize>,
-    live_nodes: ArcSwap<Vec<Arc<Url>>>,
-    seed_urls: Vec<Arc<Url>>,
+    live_nodes: Arc<ArcSwap<Vec<Arc<Url>>>>,
+    seed_urls: Arc<Vec<Arc<Url>>>,
     alternator_scheme: String,
     port: Option<u16>,
     resolver: Arc<dyn DiscoveryResolver>,
-    discovery_clients: Mutex<DiscoveryClientCache>,
-    update_lock: tokio::sync::Mutex<()>,
+    discovery_clients: Arc<Mutex<DiscoveryClientCache>>,
+    update_lock: Arc<tokio::sync::Mutex<()>>,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
     bg_task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
@@ -250,33 +487,41 @@ impl LiveNodes {
         let port = config.port();
         let seed_nodes = config.seed_hosts().unwrap_or_default();
 
-        let mut seed_urls = seed_nodes
-            .iter()
-            .filter_map(|addr| {
-                build_node_url(&alternator_scheme, addr, port)
-                    .ok()
-                    .map(Arc::new)
-            })
-            .collect::<Vec<_>>();
+        let mut seed_urls = Vec::new();
+        let mut seen_seeds = HashSet::new();
+        for addr in &seed_nodes {
+            let Ok(url) = build_node_url(&alternator_scheme, addr, port) else {
+                continue;
+            };
+            if seen_seeds.insert(url.as_str().to_string()) {
+                seed_urls.push(Arc::new(url));
+            }
+            if seed_urls.len() >= MAX_SEED_NODES {
+                break;
+            }
+        }
         seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
         if seed_urls.is_empty() {
             return None;
         }
+        let initial_live_nodes = if routing_scope.is_cluster() {
+            seed_urls.clone()
+        } else {
+            Vec::new()
+        };
 
         Some(Arc::new(Self {
             routing_scope,
             active_interval,
             idle_interval,
             counter: Arc::new(AtomicUsize::new(0)),
-            live_nodes: ArcSwap::from_pointee(seed_urls.clone()),
-            seed_urls,
+            live_nodes: Arc::new(ArcSwap::from_pointee(initial_live_nodes)),
+            seed_urls: Arc::new(seed_urls),
             alternator_scheme,
             port,
-            resolver: Arc::new(BoundedDiscoveryResolver::new(Arc::new(
-                SystemDiscoveryResolver,
-            ))),
-            discovery_clients: Mutex::new(DiscoveryClientCache::default()),
-            update_lock: tokio::sync::Mutex::new(()),
+            resolver: system_discovery_resolver(),
+            discovery_clients: Arc::new(Mutex::new(DiscoveryClientCache::default())),
+            update_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
             bg_task: std::sync::Mutex::new(None),
@@ -284,6 +529,31 @@ impl LiveNodes {
         }))
     }
 
+    fn refresh_context(&self) -> DiscoveryRefresh {
+        DiscoveryRefresh {
+            routing_scope: self.routing_scope.clone(),
+            live_nodes: self.live_nodes.clone(),
+            seed_urls: self.seed_urls.clone(),
+            alternator_scheme: self.alternator_scheme.clone(),
+            port: self.port,
+            resolver: self.resolver.clone(),
+            discovery_clients: self.discovery_clients.clone(),
+            update_lock: self.update_lock.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    async fn resolve_node_addresses(
+        &self,
+        node_addr: &Url,
+    ) -> Option<(String, bool, Vec<SocketAddr>)> {
+        self.refresh_context()
+            .resolve_node_addresses(node_addr)
+            .await
+    }
+}
+
+impl DiscoveryRefresh {
     fn host_to_uri(&self, addr: &str) -> Result<Url, url::ParseError> {
         build_node_url(&self.alternator_scheme, addr, self.port)
     }
@@ -383,7 +653,8 @@ impl LiveNodes {
             let Some(body) = Self::read_bounded_response(response).await else {
                 continue;
             };
-            let Ok(nodes) = serde_json::from_slice::<Vec<String>>(&body) else {
+            let Ok(BoundedNodeList(nodes)) = serde_json::from_slice::<BoundedNodeList>(&body)
+            else {
                 continue;
             };
             if nodes.is_empty() {
@@ -405,28 +676,24 @@ impl LiveNodes {
         saw_empty_response.then(Vec::new)
     }
 
-    fn cluster_discovery_candidates(&self) -> Vec<Arc<Url>> {
-        let mut candidates = self.live_nodes.load().as_ref().clone();
-        candidates.extend(self.seed_urls.iter().cloned());
-        candidates.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        candidates.dedup_by(|a, b| a.as_str() == b.as_str());
-        candidates.shuffle(&mut rand::rng());
-        candidates
-    }
+    fn discovery_candidates(&self) -> Vec<Arc<Url>> {
+        let mut learned = self.live_nodes.load().as_ref().clone();
+        learned.shuffle(&mut rand::rng());
 
-    fn scoped_discovery_candidates(&self) -> Vec<Arc<Url>> {
-        let mut candidates = self.live_nodes.load().as_ref().clone();
-        candidates.shuffle(&mut rand::rng());
-
+        // Reserve room for every bounded original seed so recovery remains
+        // possible even when the learned topology fills the candidate budget.
+        learned.truncate(MAX_DISCOVERY_CANDIDATES.saturating_sub(self.seed_urls.len()));
+        let mut candidates = learned;
         let mut seen = candidates
             .iter()
             .map(|candidate| candidate.as_str().to_string())
             .collect::<HashSet<_>>();
-        for seed in &self.seed_urls {
+        for seed in self.seed_urls.iter() {
             if seen.insert(seed.as_str().to_string()) {
                 candidates.push(seed.clone());
             }
         }
+        candidates.truncate(MAX_DISCOVERY_CANDIDATES);
         candidates
     }
 
@@ -435,7 +702,7 @@ impl LiveNodes {
         let mut new_nodes = Vec::new();
         let mut got_response = false;
 
-        for node_addr in self.cluster_discovery_candidates() {
+        for node_addr in self.discovery_candidates() {
             if node_is_in_list(&node_addr, &new_nodes) {
                 continue;
             }
@@ -445,6 +712,7 @@ impl LiveNodes {
                 new_nodes.append(&mut nodes);
                 new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
+                new_nodes.truncate(MAX_DISCOVERED_NODES);
             }
         }
 
@@ -460,7 +728,7 @@ impl LiveNodes {
     async fn discover_scoped_live_nodes(&self, scope: &RoutingScope) -> Option<Vec<Arc<Url>>> {
         let mut saw_empty_response = false;
 
-        for node_addr in self.scoped_discovery_candidates() {
+        for node_addr in self.discovery_candidates() {
             match self.fetch_live_nodes_for_scope(scope, &node_addr).await {
                 Some(nodes) if !nodes.is_empty() => return Some(nodes),
                 Some(_) => saw_empty_response = true,
@@ -470,7 +738,9 @@ impl LiveNodes {
 
         saw_empty_response.then(Vec::new)
     }
+}
 
+impl LiveNodes {
     /// Ensures the background discovery task is running.
     ///
     /// Idempotent and safe to call from any context: returns immediately if
@@ -494,26 +764,18 @@ impl LiveNodes {
     }
 
     fn start(self: Arc<Self>) {
-        let weak_self = Arc::downgrade(&self);
+        let refresh = self.refresh_context();
         let notify = self.notify.clone();
+        let last_activity = self.last_activity.clone();
+        let idle_interval = self.idle_interval;
+        let active_interval = self.active_interval;
 
         self.mark_activity();
         let handle = tokio::spawn(async move {
             loop {
-                let (idle_interval, active_interval, is_idle) = {
-                    let Some(strong_self) = weak_self.upgrade() else {
-                        break;
-                    };
-
-                    strong_self.update_live_nodes().await;
-
-                    let last = *strong_self.last_activity.lock().unwrap();
-                    (
-                        strong_self.idle_interval,
-                        strong_self.active_interval,
-                        last.elapsed() >= strong_self.idle_interval,
-                    )
-                };
+                refresh.update_live_nodes().await;
+                let last = *last_activity.lock().unwrap();
+                let is_idle = last.elapsed() >= idle_interval;
 
                 if !is_idle {
                     tokio::time::sleep(active_interval).await;
@@ -526,9 +788,10 @@ impl LiveNodes {
             }
         });
 
-        if let Ok(mut guard) = self.bg_task.lock() {
-            *guard = Some(handle.abort_handle());
-        }
+        *self
+            .bg_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle.abort_handle());
     }
 
     fn mark_activity(&self) {
@@ -575,6 +838,20 @@ impl LiveNodes {
     }
 
     pub async fn update_live_nodes(&self) {
+        self.refresh_context().update_live_nodes().await;
+    }
+}
+
+impl DiscoveryRefresh {
+    async fn update_live_nodes(&self) {
+        let _ = tokio::time::timeout(
+            DISCOVERY_REFRESH_TIMEOUT,
+            self.update_live_nodes_serialized(),
+        )
+        .await;
+    }
+
+    async fn update_live_nodes_serialized(&self) {
         let _update_guard = self.update_lock.lock().await;
         let mut scope = &self.routing_scope;
 
@@ -634,8 +911,11 @@ fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
 
 impl Drop for LiveNodes {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.bg_task.lock()
-            && let Some(task) = guard.take()
+        if let Some(task) = self
+            .bg_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
         {
             task.abort();
         }
@@ -645,6 +925,7 @@ impl Drop for LiveNodes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AlternatorClient;
     use crate::config::AlternatorConfig;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -744,11 +1025,18 @@ mod tests {
             status: u16,
             body: String,
         },
+        Redirect {
+            location: String,
+        },
         Truncated(String),
         OversizedDeclared,
         OversizedChunked,
         Stall,
         Reset,
+        WaitForDisconnect {
+            entered: Arc<Notify>,
+            disconnected: Arc<Notify>,
+        },
         Delayed {
             body: String,
             entered: Arc<Notify>,
@@ -847,6 +1135,12 @@ mod tests {
                                 );
                                 stream.write_all(response.as_bytes()).await.unwrap();
                             }
+                            ServerReply::Redirect { location } => {
+                                let response = format!(
+                                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                );
+                                stream.write_all(response.as_bytes()).await.unwrap();
+                            }
                             ServerReply::Truncated(body) => {
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -878,6 +1172,15 @@ mod tests {
                                 .await;
                             }
                             ServerReply::Reset => {}
+                            ServerReply::WaitForDisconnect {
+                                entered,
+                                disconnected,
+                            } => {
+                                entered.notify_one();
+                                let mut byte = [0; 1];
+                                while stream.read(&mut byte).await.unwrap_or_default() != 0 {}
+                                disconnected.notify_one();
+                            }
                             ServerReply::Delayed {
                                 body,
                                 entered,
@@ -889,7 +1192,7 @@ mod tests {
                                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                     body.len()
                                 );
-                                stream.write_all(response.as_bytes()).await.unwrap();
+                                let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
                     }
@@ -909,6 +1212,49 @@ mod tests {
         }
     }
 
+    async fn start_redirect_target() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let task_hits = hits.clone();
+        let task = tokio::spawn(async move {
+            if let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                task_hits.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).await;
+                let body = r#"["redirected.test"]"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/localnodes"), hits, task)
+    }
+
+    async fn read_request_headers<R>(stream: &mut R) -> String
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            assert!(request.len() < 16 * 1024, "request headers too large");
+        }
+        String::from_utf8(request).unwrap()
+    }
+
     fn live_nodes_with_resolver(
         config: &AlternatorConfig,
         resolver: Arc<dyn DiscoveryResolver>,
@@ -923,6 +1269,67 @@ mod tests {
             .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:1".to_string())
             .build()
+    }
+
+    #[tokio::test]
+    async fn in_flight_lookup_completion_cannot_be_missed_by_waiters() {
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
+
+        let completed = InFlightLookup::new();
+        completed.complete(SharedLookupResult::Addresses(vec![address]));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), completed.wait())
+                .await
+                .expect("completion before subscription must remain observable")
+                .unwrap(),
+            vec![address]
+        );
+
+        for _ in 0..256 {
+            let lookup = Arc::new(InFlightLookup::new());
+            let waiter_lookup = lookup.clone();
+            let waiter = tokio::spawn(async move { waiter_lookup.wait().await });
+            tokio::task::yield_now().await;
+            lookup.complete(SharedLookupResult::Addresses(vec![address]));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(100), waiter)
+                    .await
+                    .expect("racing completion must wake the waiter")
+                    .unwrap()
+                    .unwrap(),
+                vec![address]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_work_beyond_the_global_task_bound() {
+        let entries = (0..=MAX_IN_FLIGHT_DNS_LOOKUPS)
+            .map(|index| (format!("pending-{index}.test"), vec![Resolution::Pending]))
+            .collect::<Vec<_>>();
+        let inner = ScriptedResolver::new(
+            entries
+                .iter()
+                .map(|(host, answers)| (host.as_str(), answers.clone()))
+                .collect(),
+        );
+        let resolver = BoundedDiscoveryResolver::new(inner);
+
+        for (host, _) in entries.iter().take(MAX_IN_FLIGHT_DNS_LOOKUPS) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), resolver.resolve(host, 8000))
+                    .await
+                    .is_err()
+            );
+        }
+        let overflow = resolver
+            .resolve(&entries[MAX_IN_FLIGHT_DNS_LOOKUPS].0, 8000)
+            .await
+            .unwrap_err();
+
+        assert_eq!(overflow.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(resolver.in_flight_count(), MAX_IN_FLIGHT_DNS_LOOKUPS);
+        assert_eq!(resolver.peak_in_flight_count(), MAX_IN_FLIGHT_DNS_LOOKUPS);
     }
 
     async fn start_localnodes_server(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
@@ -1207,6 +1614,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redirect_response_does_not_escape_selected_address() {
+        let redirecting_address = Ipv4Addr::new(127, 0, 0, 56);
+        let good_address = Ipv4Addr::new(127, 0, 0, 57);
+        let (redirect_location, redirect_hits, redirect_target) = start_redirect_target().await;
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![
+                (
+                    redirecting_address,
+                    vec![ExpectedReply::for_path(
+                        "/localnodes",
+                        ServerReply::Redirect {
+                            location: redirect_location,
+                        },
+                    )],
+                ),
+                (
+                    good_address,
+                    vec![ExpectedReply::json(r#"["learned.internal"]"#)],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![(
+            "entry.test",
+            vec![Resolution::Addresses(vec![
+                IpAddr::V4(redirecting_address),
+                IpAddr::V4(good_address),
+            ])],
+        )]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+        redirect_target.await.unwrap();
+
+        assert_eq!(redirect_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("learned.internal")
+        );
+    }
+
+    #[tokio::test]
     async fn several_leading_and_duplicate_dns_addresses_receive_bounded_attempts() {
         let first_bad = Ipv4Addr::new(127, 0, 0, 31);
         let second_bad = Ipv4Addr::new(127, 0, 0, 32);
@@ -1298,50 +1755,116 @@ mod tests {
         ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
-        let server_key = rcgen::KeyPair::generate().unwrap();
-        let server_params = rcgen::CertificateParams::new(vec!["entry.test".to_string()]).unwrap();
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
-        let tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls::pki_types::CertificateDer::from(
-                    server_cert.der().to_vec(),
-                )],
-                rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap(),
+        let make_server_config = |dns_name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let params = rcgen::CertificateParams::new(vec![dns_name.to_string()]).unwrap();
+            let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+            Arc::new(
+                rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
+                        rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                    )
+                    .unwrap(),
             )
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-        let address = Ipv4Addr::new(127, 0, 0, 36);
-        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(address), 0))
+        };
+        // The good certificate contains only the logical DNS name, never a
+        // selected socket IP. The first address has a trusted but wrong name.
+        let good_tls_config = make_server_config("localhost");
+        let bad_tls_config = make_server_config("wrong-name.test");
+
+        let good_address = Ipv4Addr::LOCALHOST;
+        let bad_address = Ipv4Addr::new(127, 0, 0, 36);
+        let good_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(good_address), 0))
             .await
             .unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.accept(stream).await.unwrap();
-            let mut request = [0; 2048];
-            let count = stream.read(&mut request).await.unwrap();
-            let request = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
-            assert!(request.starts_with("get /localnodes http/1.1"));
-            assert!(request.contains(&format!("\r\nhost: entry.test:{port}\r\n")));
-            let body = r#"["learned.internal"]"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).await.unwrap();
-        });
+        let port = good_listener.local_addr().unwrap().port();
+        let bad_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(bad_address), port))
+            .await
+            .unwrap();
+        let bad_sni = Arc::new(Mutex::new(Vec::new()));
+        let good_sni = Arc::new(Mutex::new(Vec::new()));
+        let good_hosts = Arc::new(Mutex::new(Vec::new()));
+
+        let bad_server = {
+            let bad_sni = bad_sni.clone();
+            tokio::spawn(async move {
+                let (stream, _) = bad_listener.accept().await.unwrap();
+                let start = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    stream,
+                )
+                .await
+                .unwrap();
+                bad_sni
+                    .lock()
+                    .unwrap()
+                    .push(start.client_hello().server_name().unwrap().to_string());
+                assert!(start.into_stream(bad_tls_config).await.is_err());
+            })
+        };
+        let good_server = {
+            let good_sni = good_sni.clone();
+            let good_hosts = good_hosts.clone();
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (stream, _) = good_listener.accept().await.unwrap();
+                    let start = tokio_rustls::LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(),
+                        stream,
+                    )
+                    .await
+                    .unwrap();
+                    good_sni
+                        .lock()
+                        .unwrap()
+                        .push(start.client_hello().server_name().unwrap().to_string());
+                    let mut stream = start.into_stream(good_tls_config.clone()).await.unwrap();
+                    let request = read_request_headers(&mut stream).await;
+                    let request_lower = request.to_ascii_lowercase();
+                    assert!(request_lower.contains(&format!("\r\nhost: localhost:{port}\r\n")));
+                    good_hosts.lock().unwrap().push(format!("localhost:{port}"));
+
+                    let (content_type, body) = if request.starts_with("GET /localnodes HTTP/1.1") {
+                        ("application/json", r#"["localhost"]"#)
+                    } else {
+                        assert!(request.starts_with("POST / HTTP/1.1"));
+                        ("application/x-amz-json-1.0", r#"{"TableNames":[]}"#)
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            })
+        };
+
+        let tls_context = aws_smithy_http_client::tls::TlsContext::builder()
+            .with_trust_store(
+                aws_smithy_http_client::tls::TrustStore::empty()
+                    .with_pem_certificate(ca_cert.pem().into_bytes()),
+            )
+            .build()
+            .unwrap();
+        let http_client = aws_smithy_http_client::Builder::new()
+            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .tls_context(tls_context)
+            .build_https();
         let resolver = ScriptedResolver::new(vec![(
-            "entry.test",
-            vec![Resolution::Addresses(vec![IpAddr::V4(address)])],
+            "localhost",
+            vec![Resolution::Addresses(vec![
+                IpAddr::V4(bad_address),
+                IpAddr::V4(good_address),
+            ])],
         )]);
         let config = AlternatorConfig::builder()
             .behavior_version_latest()
-            .scheme("https")
-            .port(port)
-            .seed_hosts(["entry.test"])
+            .http_client(http_client)
+            .endpoint_url(format!("https://localhost:{port}"))
             .build();
         let nodes = live_nodes_with_resolver(&config, resolver);
         nodes
@@ -1352,12 +1875,27 @@ mod tests {
             Some(reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap());
 
         nodes.update_live_nodes().await;
-        server.await.unwrap();
-
         let snapshot = nodes.live_nodes.load();
         assert_eq!(snapshot[0].scheme(), "https");
-        assert_eq!(snapshot[0].host_str(), Some("learned.internal"));
+        assert_eq!(snapshot[0].host_str(), Some("localhost"));
         assert_eq!(snapshot[0].port(), Some(port));
+        drop(snapshot);
+
+        nodes.discovery_started.store(true, Ordering::Release);
+        let client = AlternatorClient::from_conf_with_live_nodes(config, nodes);
+        client.list_tables().send().await.unwrap();
+
+        bad_server.await.unwrap();
+        good_server.await.unwrap();
+        assert_eq!(bad_sni.lock().unwrap().as_slice(), &["localhost"]);
+        assert_eq!(
+            good_sni.lock().unwrap().as_slice(),
+            &["localhost", "localhost"]
+        );
+        assert_eq!(
+            good_hosts.lock().unwrap().as_slice(),
+            &[format!("localhost:{port}"), format!("localhost:{port}")]
+        );
     }
 
     #[tokio::test]
@@ -1389,11 +1927,13 @@ mod tests {
             .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
             .build();
         let nodes = live_nodes_with_resolver(&config, resolver);
+        let previous = Arc::new(Url::parse(&format!("http://127.0.0.99:{port}/")).unwrap());
+        nodes.live_nodes.store(Arc::new(vec![previous.clone()]));
 
         nodes.update_live_nodes().await;
         join_servers(servers).await;
 
-        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("entry.test"));
+        assert_eq!(nodes.live_nodes.load().as_slice(), &[previous]);
     }
 
     #[tokio::test]
@@ -1479,26 +2019,27 @@ mod tests {
                 Resolution::Addresses(vec![IpAddr::V4(address)]),
             ],
         )]);
-        let resolver: Arc<dyn DiscoveryResolver> =
-            Arc::new(BoundedDiscoveryResolver::new(inner.clone()));
+        let resolver = Arc::new(BoundedDiscoveryResolver::new(inner.clone()));
         let config = AlternatorConfig::builder()
             .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["entry.test"])
             .build();
-        let nodes = live_nodes_with_resolver(&config, resolver);
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
 
         nodes.update_live_nodes().await;
-        assert_eq!(inner.calls_for("entry.test"), MAX_IN_FLIGHT_DNS_LOOKUPS);
+        assert_eq!(inner.calls_for("entry.test"), 1);
+        assert_eq!(resolver.in_flight_count(), 1);
+        assert_eq!(resolver.peak_in_flight_count(), 1);
 
         let second_nodes = nodes.clone();
         let second = tokio::spawn(async move { second_nodes.update_live_nodes().await });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             inner.calls_for("entry.test"),
-            MAX_IN_FLIGHT_DNS_LOOKUPS,
-            "a second OS lookup must wait behind the timed-out lookup"
+            1,
+            "a second refresh must coalesce with the timed-out lookup"
         );
 
         release.notify_one();
@@ -1506,6 +2047,9 @@ mod tests {
             .await
             .expect("refresh should resume when the stalled lookup finishes")
             .unwrap();
+        assert_eq!(resolver.in_flight_count(), 0);
+
+        nodes.update_live_nodes().await;
         join_servers(servers).await;
 
         assert_eq!(inner.calls_for("entry.test"), 2);
@@ -1513,6 +2057,62 @@ mod tests {
             nodes.live_nodes.load()[0].host_str(),
             Some("learned.internal")
         );
+    }
+
+    #[tokio::test]
+    async fn permanently_stalled_seed_does_not_poison_healthy_seed_or_retries() {
+        let healthy_address = Ipv4Addr::new(127, 0, 0, 55);
+        let healthy_reply = || {
+            ExpectedReply::for_path(
+                "/localnodes?dc=dc1",
+                ServerReply::Http {
+                    status: 200,
+                    body: r#"["127.0.0.55"]"#.to_string(),
+                },
+            )
+            .for_host("b-healthy.test")
+        };
+        let (port, servers) = start_address_servers(
+            "b-healthy.test",
+            vec![(
+                healthy_address,
+                vec![healthy_reply(), healthy_reply(), healthy_reply()],
+            )],
+        )
+        .await;
+        let inner = ScriptedResolver::new(vec![
+            ("a-pending.test", vec![Resolution::Pending]),
+            (
+                "b-healthy.test",
+                vec![
+                    Resolution::Addresses(vec![IpAddr::V4(healthy_address)]),
+                    Resolution::Addresses(vec![IpAddr::V4(healthy_address)]),
+                    Resolution::Addresses(vec![IpAddr::V4(healthy_address)]),
+                ],
+            ),
+        ]);
+        let resolver = Arc::new(BoundedDiscoveryResolver::new(inner.clone()));
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["a-pending.test", "b-healthy.test"])
+            .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+
+        for _ in 0..3 {
+            nodes.update_live_nodes().await;
+            assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("127.0.0.55"));
+            nodes.live_nodes.store(Arc::new(Vec::new()));
+        }
+        join_servers(servers).await;
+
+        assert_eq!(inner.calls_for("a-pending.test"), 1);
+        assert_eq!(inner.calls_for("b-healthy.test"), 3);
+        assert_eq!(resolver.in_flight_count(), 1);
+        assert_eq!(resolver.peak_in_flight_count(), 2);
+        assert!(resolver.peak_in_flight_count() <= MAX_IN_FLIGHT_DNS_LOOKUPS);
     }
 
     #[tokio::test]
@@ -1562,6 +2162,59 @@ mod tests {
             nodes.live_nodes.load()[0].host_str(),
             Some("learned.internal")
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_last_owner_aborts_stalled_multi_address_refresh_promptly() {
+        let first_address = Ipv4Addr::new(127, 0, 1, 1);
+        let entered = Arc::new(Notify::new());
+        let disconnected = Arc::new(Notify::new());
+        let (port, servers) = start_address_servers(
+            "entry.test",
+            vec![(
+                first_address,
+                vec![ExpectedReply::for_path(
+                    "/localnodes",
+                    ServerReply::WaitForDisconnect {
+                        entered: entered.clone(),
+                        disconnected: disconnected.clone(),
+                    },
+                )],
+            )],
+        )
+        .await;
+        let addresses = (1..=MAX_RESOLVED_ADDRESSES)
+            .map(|last| IpAddr::V4(Ipv4Addr::new(127, 0, 1, last as u8)))
+            .collect();
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["entry.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, Arc::new(StaticResolver { addresses }));
+
+        nodes.ensure_discovery_started();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("background refresh did not reach the stalled address");
+        let weak_nodes = Arc::downgrade(&nodes);
+        let dropped_at = Instant::now();
+        drop(nodes);
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while weak_nodes.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background refresh retained the last LiveNodes owner");
+        assert!(dropped_at.elapsed() < Duration::from_millis(250));
+
+        tokio::time::timeout(Duration::from_millis(250), disconnected.notified())
+            .await
+            .expect("dropping LiveNodes did not cancel the stalled discovery request");
+        join_servers(servers).await;
     }
 
     #[tokio::test]
@@ -1718,6 +2371,95 @@ mod tests {
         assert_eq!(nodes.seed_urls[0].host_str(), Some("entry.test"));
         nodes.discovery_started.store(true, Ordering::Release);
         assert!(nodes.get_next_node_round_robin(&HashSet::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_operations_fail_closed_until_discovery_recovers() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = seed_listener.local_addr().unwrap().port();
+        let learned_listener = TcpListener::bind(format!("127.0.0.2:{port}"))
+            .await
+            .unwrap();
+        let seed_posts = Arc::new(AtomicUsize::new(0));
+        let learned_posts = Arc::new(AtomicUsize::new(0));
+
+        let seed_task = {
+            let seed_posts = seed_posts.clone();
+            tokio::spawn(async move {
+                let discovery_responses = ["[]", "not-json", r#"["127.0.0.2"]"#];
+                let mut discovery_index = 0;
+                while discovery_index < discovery_responses.len() {
+                    let (mut stream, _) = seed_listener.accept().await.unwrap();
+                    let request = read_request_headers(&mut stream).await;
+                    if request.starts_with("POST / HTTP/1.1") {
+                        seed_posts.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"TableNames":[]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).await.unwrap();
+                        continue;
+                    }
+
+                    assert!(request.starts_with("GET /localnodes?dc=dc1 HTTP/1.1"));
+                    let body = discovery_responses[discovery_index];
+                    discovery_index += 1;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            })
+        };
+        let learned_task = {
+            let learned_posts = learned_posts.clone();
+            tokio::spawn(async move {
+                let (mut stream, _) = learned_listener.accept().await.unwrap();
+                let request = read_request_headers(&mut stream).await;
+                assert!(request.starts_with("POST / HTTP/1.1"));
+                learned_posts.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"TableNames":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            })
+        };
+
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        assert!(nodes.live_nodes.load().is_empty());
+        nodes.discovery_started.store(true, Ordering::Release);
+        let client = AlternatorClient::from_conf_with_live_nodes(config, nodes.clone());
+
+        assert!(client.list_tables().send().await.is_err());
+        assert_eq!(seed_posts.load(Ordering::SeqCst), 0);
+
+        nodes.update_live_nodes().await;
+        assert!(nodes.live_nodes.load().is_empty());
+        assert!(client.list_tables().send().await.is_err());
+        assert_eq!(seed_posts.load(Ordering::SeqCst), 0);
+
+        nodes.update_live_nodes().await;
+        assert!(nodes.live_nodes.load().is_empty());
+        assert!(client.list_tables().send().await.is_err());
+        assert_eq!(seed_posts.load(Ordering::SeqCst), 0);
+
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("127.0.0.2"));
+        client.list_tables().send().await.unwrap();
+
+        seed_task.await.unwrap();
+        learned_task.await.unwrap();
+        assert_eq!(seed_posts.load(Ordering::SeqCst), 0);
+        assert_eq!(learned_posts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1899,6 +2641,45 @@ mod tests {
         assert_eq!(addresses.len(), MAX_RESOLVED_ADDRESSES);
         assert_eq!(addresses[0].ip(), unique_addresses[0]);
         assert_eq!(addresses[1].ip(), unique_addresses[1]);
+    }
+
+    #[test]
+    fn parsed_topology_and_refresh_candidates_are_bounded() {
+        let maximum = vec!["127.0.0.1"; MAX_DISCOVERED_NODES];
+        let parsed: BoundedNodeList =
+            serde_json::from_slice(&serde_json::to_vec(&maximum).unwrap()).unwrap();
+        assert_eq!(parsed.0.len(), MAX_DISCOVERED_NODES);
+
+        let over_limit = vec!["127.0.0.1"; MAX_DISCOVERED_NODES + 1];
+        assert!(
+            serde_json::from_slice::<BoundedNodeList>(&serde_json::to_vec(&over_limit).unwrap())
+                .is_err()
+        );
+
+        let seeds = (0..(MAX_SEED_NODES + 10))
+            .map(|index| format!("seed-{index}.test"))
+            .collect::<Vec<_>>();
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(seeds)
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        assert_eq!(nodes.seed_urls.len(), MAX_SEED_NODES);
+
+        let learned = (0..MAX_DISCOVERED_NODES)
+            .map(|index| {
+                Arc::new(Url::parse(&format!("http://learned-{index}.test:8000/")).unwrap())
+            })
+            .collect();
+        nodes.live_nodes.store(Arc::new(learned));
+        let candidates = nodes.refresh_context().discovery_candidates();
+        assert_eq!(candidates.len(), MAX_DISCOVERY_CANDIDATES);
+        for seed in nodes.seed_urls.iter() {
+            assert!(node_is_in_list(seed, &candidates));
+        }
+        assert_eq!(DISCOVERY_REFRESH_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
