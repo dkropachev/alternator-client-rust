@@ -48,12 +48,10 @@
 //! refresh budget is split across scopes in priority order, so an unavailable
 //! preferred scope cannot perpetually starve its fallbacks. Candidate and
 //! address queues rotate before I/O, so repeated refreshes make progress past a
-//! deadline. All configured seeds and
-//! all valid nodes in a bounded 1 MiB response are retained; work is bounded by
-//! time rather than silently truncating configuration or topology. Cluster
-//! unions deduplicate incrementally and fail closed without replacing the old
-//! snapshot if unique multi-response accumulation exceeds its derived node or
-//! URL-memory bounds.
+//! deadline. All valid nodes in a bounded 1 MiB response are retained. Seeds
+//! and cluster unions share derived node and URL-memory bounds; an oversized
+//! configuration or unique multi-response accumulation fails closed as a whole
+//! rather than silently truncating configuration or replacing a valid snapshot.
 //!
 //! DNS work is globally limited to eight in-flight lookups, coalesced by
 //! normalized hostname. Operating-system name resolution is not reliably
@@ -73,12 +71,14 @@
 //! all datacenters, the initial configuration must include at least one working
 //! seed host from every datacenter that should receive traffic.
 //!
-//! A non-empty successful result atomically replaces [`live_nodes`] using
-//! [`ArcSwap`]. A fully failed refresh preserves the previous snapshot and the
-//! original seeds. Non-cluster seeds are discovery-only until a scoped or
-//! fallback response validates a routing snapshot. A conclusive empty scoped
-//! result retains the empty routing snapshot and the seeds as future discovery
-//! candidates.
+//! A completed non-empty result atomically replaces [`live_nodes`] using
+//! [`ArcSwap`]. A long-running cluster pass may publish bounded atomic unions of
+//! newly validated nodes and the last-known-good snapshot, then replace the
+//! union after every candidate has a terminal outcome. A fully failed refresh
+//! preserves the previous snapshot and the original seeds. Non-cluster seeds
+//! are discovery-only until a scoped or fallback response validates a routing
+//! snapshot. A conclusive empty scoped result retains the empty routing snapshot
+//! and the seeds as future discovery candidates.
 //!
 //!  # Lifetime
 //!
@@ -131,6 +131,7 @@ use url::{Host, Url};
 
 const DEFAULT_ACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const MIN_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_millis(1);
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -148,13 +149,45 @@ const MAX_CLUSTER_PASS_NODES: usize = (MAX_DISCOVERY_RESPONSE_BYTES - 1) / 4;
 // normalization while bounding unique multi-response cluster accumulation.
 const MAX_CLUSTER_PASS_URL_BYTES: usize = MAX_DISCOVERY_RESPONSE_BYTES * 16;
 const MAX_IN_FLIGHT_DNS_LOOKUPS: usize = 8;
+const RESERVED_SEED_DNS_LOOKUPS: usize = 2;
+const MAX_IN_FLIGHT_LEARNED_DNS_LOOKUPS: usize =
+    MAX_IN_FLIGHT_DNS_LOOKUPS - RESERVED_SEED_DNS_LOOKUPS;
 const DISCOVERY_SKIP_YIELD_INTERVAL: usize = 256;
+
+fn push_unique_node_with_limits(
+    nodes: &mut Vec<Arc<Url>>,
+    keys: &mut HashSet<String>,
+    url_bytes: &mut usize,
+    node: Arc<Url>,
+    max_nodes: usize,
+    max_url_bytes: usize,
+) -> Option<bool> {
+    let key = node.as_str();
+    if keys.contains(key) {
+        return Some(false);
+    }
+    if nodes.len() >= max_nodes {
+        return None;
+    }
+    let next_url_bytes = url_bytes.checked_add(key.len())?;
+    if next_url_bytes > max_url_bytes {
+        return None;
+    }
+    keys.insert(key.to_string());
+    nodes.push(node);
+    *url_bytes = next_url_bytes;
+    Some(true)
+}
 
 type ResolveFuture<'a> =
     Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'a>>;
 
 trait DiscoveryResolver: std::fmt::Debug + Send + Sync {
     fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a>;
+
+    fn resolve_seed<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        self.resolve(host, port)
+    }
 }
 
 #[derive(Debug)]
@@ -227,6 +260,12 @@ impl InFlightLookup {
 
 type LookupKey = String;
 
+#[derive(Debug)]
+struct RegisteredLookup {
+    lookup: Arc<InFlightLookup>,
+    is_seed: bool,
+}
+
 fn normalize_hostname(host: &str) -> String {
     // DNS names are case-insensitive, but a terminal dot is semantic: `foo`
     // may use a resolver search path while `foo.` is absolute.
@@ -241,7 +280,7 @@ fn socket_address_with_port(mut address: SocketAddr, port: u16) -> SocketAddr {
 #[derive(Debug)]
 struct BoundedResolverState {
     lookup_slots: Arc<tokio::sync::Semaphore>,
-    in_flight: Mutex<HashMap<LookupKey, Arc<InFlightLookup>>>,
+    in_flight: Mutex<HashMap<LookupKey, RegisteredLookup>>,
     peak_in_flight: AtomicUsize,
 }
 
@@ -254,10 +293,14 @@ impl BoundedResolverState {
         }
     }
 
-    fn register(self: &Arc<Self>, key: LookupKey) -> std::io::Result<(Arc<InFlightLookup>, bool)> {
+    fn register(
+        self: &Arc<Self>,
+        key: LookupKey,
+        is_seed: bool,
+    ) -> std::io::Result<(Arc<InFlightLookup>, bool)> {
         let mut in_flight = self.in_flight.lock().unwrap();
-        if let Some(lookup) = in_flight.get(&key) {
-            return Ok((lookup.clone(), false));
+        if let Some(registered) = in_flight.get(&key) {
+            return Ok((registered.lookup.clone(), false));
         }
         if in_flight.len() >= MAX_IN_FLIGHT_DNS_LOOKUPS {
             return Err(std::io::Error::new(
@@ -265,9 +308,27 @@ impl BoundedResolverState {
                 "DNS lookup capacity exhausted",
             ));
         }
+        if !is_seed
+            && in_flight
+                .values()
+                .filter(|registered| !registered.is_seed)
+                .count()
+                >= MAX_IN_FLIGHT_LEARNED_DNS_LOOKUPS
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "DNS lookup capacity reserved for configured seeds",
+            ));
+        }
 
         let lookup = Arc::new(InFlightLookup::new());
-        in_flight.insert(key, lookup.clone());
+        in_flight.insert(
+            key,
+            RegisteredLookup {
+                lookup: lookup.clone(),
+                is_seed,
+            },
+        );
         self.peak_in_flight
             .fetch_max(in_flight.len(), Ordering::Relaxed);
         Ok((lookup, true))
@@ -287,7 +348,7 @@ impl Drop for LookupRegistration {
             let mut in_flight = state.in_flight.lock().unwrap();
             if in_flight
                 .get(&self.key)
-                .is_some_and(|current| Arc::ptr_eq(current, &self.lookup))
+                .is_some_and(|current| Arc::ptr_eq(&current.lookup, &self.lookup))
             {
                 in_flight.remove(&self.key);
             }
@@ -304,7 +365,8 @@ impl Drop for LookupRegistration {
 /// Coalesces normalized hostnames while allowing unrelated names to progress
 /// through a small global worker budget. Timed-out callers do not cancel or
 /// duplicate underlying OS resolver work, which is not reliably cancellable.
-/// Saturation fails new unique names immediately; literal IP seeds bypass it.
+/// Learned-name saturation fails new unique learned names immediately while
+/// reserving two slots for configured seeds. Literal IP seeds bypass it.
 #[derive(Debug)]
 struct BoundedDiscoveryResolver {
     inner: Arc<dyn DiscoveryResolver>,
@@ -328,10 +390,13 @@ impl BoundedDiscoveryResolver {
     fn peak_in_flight_count(&self) -> usize {
         self.state.peak_in_flight.load(Ordering::Relaxed)
     }
-}
 
-impl DiscoveryResolver for BoundedDiscoveryResolver {
-    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+    fn resolve_with_priority<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        is_seed: bool,
+    ) -> ResolveFuture<'a> {
         let host = host.to_string();
         let inner = self.inner.clone();
         let state = self.state.clone();
@@ -341,7 +406,7 @@ impl DiscoveryResolver for BoundedDiscoveryResolver {
             // port, while keeping relative and terminal-dot absolute names
             // distinct.
             let key = normalize_hostname(&host);
-            let (lookup, should_spawn) = state.register(key.clone())?;
+            let (lookup, should_spawn) = state.register(key.clone(), is_seed)?;
             if should_spawn {
                 let task_lookup = lookup.clone();
                 let task_state = state.clone();
@@ -367,7 +432,7 @@ impl DiscoveryResolver for BoundedDiscoveryResolver {
                         task_lookup.complete(result);
                         if in_flight
                             .get(&_registration.key)
-                            .is_some_and(|current| Arc::ptr_eq(current, &task_lookup))
+                            .is_some_and(|current| Arc::ptr_eq(&current.lookup, &task_lookup))
                         {
                             in_flight.remove(&_registration.key);
                         }
@@ -376,6 +441,16 @@ impl DiscoveryResolver for BoundedDiscoveryResolver {
             }
             lookup.wait().await
         })
+    }
+}
+
+impl DiscoveryResolver for BoundedDiscoveryResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        self.resolve_with_priority(host, port, false)
+    }
+
+    fn resolve_seed<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        self.resolve_with_priority(host, port, true)
     }
 }
 
@@ -443,6 +518,7 @@ impl DiscoveryClientCache {
 #[derive(Debug)]
 enum DiscoveryOutcome {
     Found(Vec<Arc<Url>>),
+    PartialFound(Vec<Arc<Url>>),
     AuthoritativeEmpty,
     Unavailable,
     Incomplete,
@@ -548,47 +624,129 @@ impl AddressDiscoveryPass {
 }
 
 #[derive(Debug, Default)]
+struct DiscoveryCandidatePass {
+    pending_learned: VecDeque<Arc<Url>>,
+    pending_seeds: VecDeque<Arc<Url>>,
+    active_candidate: Option<(Arc<Url>, bool)>,
+    prefer_seed: bool,
+}
+
+impl DiscoveryCandidatePass {
+    fn new(pending_learned: VecDeque<Arc<Url>>, pending_seeds: VecDeque<Arc<Url>>) -> Self {
+        Self {
+            pending_learned,
+            pending_seeds,
+            ..Self::default()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.pending_learned.len() + self.pending_seeds.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending_learned.is_empty() && self.pending_seeds.is_empty()
+    }
+
+    fn resume_after_cutoff(&mut self) {
+        let Some((candidate, is_seed)) = self.active_candidate.take() else {
+            return;
+        };
+        self.requeue_after_cutoff(candidate, is_seed);
+    }
+
+    fn begin_next(&mut self) -> Option<Arc<Url>> {
+        let (candidate, is_seed) = if self.prefer_seed {
+            self.pending_seeds
+                .pop_front()
+                .map(|candidate| (candidate, true))
+                .or_else(|| {
+                    self.pending_learned
+                        .pop_front()
+                        .map(|candidate| (candidate, false))
+                })?
+        } else {
+            self.pending_learned
+                .pop_front()
+                .map(|candidate| (candidate, false))
+                .or_else(|| {
+                    self.pending_seeds
+                        .pop_front()
+                        .map(|candidate| (candidate, true))
+                })?
+        };
+        self.prefer_seed = false;
+        self.active_candidate = Some((candidate.clone(), is_seed));
+        Some(candidate)
+    }
+
+    fn finish_active(&mut self) -> (Arc<Url>, bool) {
+        self.active_candidate
+            .take()
+            .expect("selected discovery candidate remains active")
+    }
+
+    fn requeue_after_cutoff(&mut self, candidate: Arc<Url>, is_seed: bool) {
+        if is_seed {
+            self.pending_seeds.push_back(candidate);
+        } else {
+            self.pending_learned.push_back(candidate);
+        }
+        // A budget-consuming candidate must not monopolize consecutive
+        // refreshes while the other recovery source still has work.
+        self.prefer_seed = !is_seed;
+    }
+
+    fn alternate_after_budget_exhaustion(&mut self, last_was_seed: bool) {
+        self.prefer_seed = !last_was_seed;
+    }
+}
+
+#[derive(Debug, Default)]
 struct ScopedDiscoveryPass {
-    pending_candidates: VecDeque<Arc<Url>>,
-    active_candidate: Option<Arc<Url>>,
+    candidates: DiscoveryCandidatePass,
     saw_empty_response: bool,
 }
 
 #[derive(Debug, Default)]
 struct ClusterDiscoveryPass {
-    pending_candidates: VecDeque<Arc<Url>>,
-    active_candidate: Option<Arc<Url>>,
+    candidates: DiscoveryCandidatePass,
     discovered: Vec<Arc<Url>>,
     discovered_keys: HashSet<String>,
     discovered_url_bytes: usize,
     got_response: bool,
+    saw_empty_response: bool,
     saw_unavailable: bool,
     overflowed: bool,
+    partial_published_count: usize,
 }
 
 impl ClusterDiscoveryPass {
     fn merge_response(&mut self, nodes: Vec<Arc<Url>>) {
         self.got_response = true;
         for node in nodes {
-            let key = node.as_str().to_string();
-            if self.discovered_keys.contains(&key) {
-                continue;
-            }
-            if self.discovered.len() >= MAX_CLUSTER_PASS_NODES {
+            if push_unique_node_with_limits(
+                &mut self.discovered,
+                &mut self.discovered_keys,
+                &mut self.discovered_url_bytes,
+                node,
+                MAX_CLUSTER_PASS_NODES,
+                MAX_CLUSTER_PASS_URL_BYTES,
+            )
+            .is_none()
+            {
                 self.overflowed = true;
                 return;
             }
-            let Some(next_url_bytes) = self.discovered_url_bytes.checked_add(key.len()) else {
-                self.overflowed = true;
-                return;
-            };
-            if next_url_bytes > MAX_CLUSTER_PASS_URL_BYTES {
-                self.overflowed = true;
-                return;
-            }
-            self.discovered_keys.insert(key);
-            self.discovered.push(node);
-            self.discovered_url_bytes = next_url_bytes;
+        }
+    }
+
+    fn incomplete_outcome(&mut self) -> DiscoveryOutcome {
+        if self.discovered.len() > self.partial_published_count {
+            self.partial_published_count = self.discovered.len();
+            DiscoveryOutcome::PartialFound(self.discovered.clone())
+        } else {
+            DiscoveryOutcome::Incomplete
         }
     }
 }
@@ -634,6 +792,7 @@ impl DiscoveryProgress {
 struct DiscoveryRefresh {
     routing_scope: RoutingScope,
     live_nodes: Arc<ArcSwap<Vec<Arc<Url>>>>,
+    published_scope_index: Arc<Mutex<Option<usize>>>,
     seed_urls: Arc<Vec<Arc<Url>>>,
     alternator_scheme: String,
     port: Option<u16>,
@@ -650,6 +809,7 @@ pub struct LiveNodes {
     idle_interval: Duration,
     counter: Arc<AtomicUsize>,
     live_nodes: Arc<ArcSwap<Vec<Arc<Url>>>>,
+    published_scope_index: Arc<Mutex<Option<usize>>>,
     seed_urls: Arc<Vec<Arc<Url>>>,
     alternator_scheme: String,
     port: Option<u16>,
@@ -667,35 +827,65 @@ impl LiveNodes {
     pub fn new(config: &crate::config::AlternatorConfig) -> Option<Arc<Self>> {
         let active_interval = config
             .active_interval()
-            .unwrap_or(DEFAULT_ACTIVE_REFRESH_INTERVAL);
+            .unwrap_or(DEFAULT_ACTIVE_REFRESH_INTERVAL)
+            .max(MIN_DISCOVERY_REFRESH_INTERVAL);
         let idle_interval = config
             .idle_interval()
-            .unwrap_or(DEFAULT_IDLE_REFRESH_INTERVAL);
+            .unwrap_or(DEFAULT_IDLE_REFRESH_INTERVAL)
+            .max(MIN_DISCOVERY_REFRESH_INTERVAL);
         let routing_scope = config
             .routing_scope()
             .unwrap_or(RoutingScope::from_cluster());
         let alternator_scheme = config.scheme().unwrap_or("http".to_string());
         let port = config.port();
-        let seed_nodes = config.seed_hosts().unwrap_or_default();
+        let seed_nodes = config.seed_hosts()?;
+        if seed_nodes.is_empty() {
+            // An explicitly empty list is the established way to disable
+            // client-side discovery and load balancing.
+            return None;
+        }
 
         let mut seed_urls = Vec::new();
         let mut seen_seeds = HashSet::new();
+        let mut seed_url_bytes = 0usize;
         for addr in &seed_nodes {
             let Ok(url) = build_node_url(&alternator_scheme, addr, port) else {
                 continue;
             };
-            if seen_seeds.insert(url.as_str().to_string()) {
-                seed_urls.push(Arc::new(url));
+            if push_unique_node_with_limits(
+                &mut seed_urls,
+                &mut seen_seeds,
+                &mut seed_url_bytes,
+                Arc::new(url),
+                MAX_CLUSTER_PASS_NODES,
+                MAX_CLUSTER_PASS_URL_BYTES,
+            )
+            .is_none()
+            {
+                // Reject an oversized configuration as a whole. Silently
+                // truncating seeds could discard the only reachable recovery
+                // endpoint and make discovery order-dependent.
+                seed_urls.clear();
+                break;
             }
         }
         seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        if seed_urls.is_empty() {
-            return None;
-        }
-        let initial_live_nodes = if routing_scope.is_cluster() {
+        // A non-empty but wholly malformed or oversized seed configuration
+        // remains an enabled, empty routing plan. Returning `None` here would
+        // remove the routing interceptor and silently fall through to the SDK
+        // endpoint instead of failing closed.
+        let initial_scope_index = routing_scope
+            .scope_chain()
+            .and_then(|chain| chain.iter().position(|scope| scope.is_cluster()));
+        let initial_live_nodes = if initial_scope_index.is_some() {
             seed_urls.clone()
         } else {
             Vec::new()
+        };
+        let published_scope_index = if initial_live_nodes.is_empty() {
+            None
+        } else {
+            initial_scope_index
         };
 
         Some(Arc::new(Self {
@@ -704,6 +894,7 @@ impl LiveNodes {
             idle_interval,
             counter: Arc::new(AtomicUsize::new(0)),
             live_nodes: Arc::new(ArcSwap::from_pointee(initial_live_nodes)),
+            published_scope_index: Arc::new(Mutex::new(published_scope_index)),
             seed_urls: Arc::new(seed_urls),
             alternator_scheme,
             port,
@@ -722,6 +913,7 @@ impl LiveNodes {
         DiscoveryRefresh {
             routing_scope: self.routing_scope.clone(),
             live_nodes: self.live_nodes.clone(),
+            published_scope_index: self.published_scope_index.clone(),
             seed_urls: self.seed_urls.clone(),
             alternator_scheme: self.alternator_scheme.clone(),
             port: self.port,
@@ -755,11 +947,19 @@ impl DiscoveryRefresh {
         let port = node_addr.port_or_known_default()?;
         let (logical_host, is_domain, addresses) = match node_addr.host()? {
             Host::Domain(host) => {
-                let addresses =
-                    tokio::time::timeout(DNS_LOOKUP_TIMEOUT, self.resolver.resolve(host, port))
-                        .await
-                        .ok()?
-                        .ok()?;
+                let is_configured_seed = self
+                    .seed_urls
+                    .iter()
+                    .any(|seed| seed.as_str() == node_addr.as_str());
+                let lookup = if is_configured_seed {
+                    self.resolver.resolve_seed(host, port)
+                } else {
+                    self.resolver.resolve(host, port)
+                };
+                let addresses = tokio::time::timeout(DNS_LOOKUP_TIMEOUT, lookup)
+                    .await
+                    .ok()?
+                    .ok()?;
                 (host.to_string(), true, addresses)
             }
             Host::Ipv4(ip) => (
@@ -1016,20 +1216,26 @@ impl DiscoveryRefresh {
         }
     }
 
-    fn discovery_candidates(&self) -> Vec<Arc<Url>> {
-        let mut candidates = self.live_nodes.load().as_ref().clone();
-        candidates.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        candidates.dedup_by(|left, right| left.as_str() == right.as_str());
-        let mut seen = candidates
+    fn discovery_candidate_queues(&self) -> (VecDeque<Arc<Url>>, VecDeque<Arc<Url>>) {
+        let seed_keys = self
+            .seed_urls
             .iter()
-            .map(|candidate| candidate.as_str().to_string())
+            .map(|seed| seed.as_str())
             .collect::<HashSet<_>>();
-        for seed in self.seed_urls.iter() {
-            if seen.insert(seed.as_str().to_string()) {
-                candidates.push(seed.clone());
-            }
-        }
-        candidates
+        let mut learned = self.live_nodes.load().as_ref().clone();
+        learned.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        learned.dedup_by(|left, right| left.as_str() == right.as_str());
+        learned.retain(|candidate| !seed_keys.contains(candidate.as_str()));
+        (
+            learned.into(),
+            self.seed_urls.iter().cloned().collect::<VecDeque<_>>(),
+        )
+    }
+
+    #[cfg(test)]
+    fn discovery_candidates(&self) -> Vec<Arc<Url>> {
+        let (learned, seeds) = self.discovery_candidate_queues();
+        learned.into_iter().chain(seeds).collect()
     }
 
     async fn discover_cluster_live_nodes(
@@ -1044,9 +1250,12 @@ impl DiscoveryRefresh {
             progress
                 .cluster_passes
                 .entry(scope_index)
-                .or_insert_with(|| ClusterDiscoveryPass {
-                    pending_candidates: self.discovery_candidates().into(),
-                    ..ClusterDiscoveryPass::default()
+                .or_insert_with(|| {
+                    let (learned, seeds) = self.discovery_candidate_queues();
+                    ClusterDiscoveryPass {
+                        candidates: DiscoveryCandidatePass::new(learned, seeds),
+                        ..ClusterDiscoveryPass::default()
+                    }
                 });
         }
 
@@ -1054,11 +1263,10 @@ impl DiscoveryRefresh {
             let mut progress = self.progress.lock().unwrap();
             let pass = progress.cluster_passes.get_mut(&scope_index).unwrap();
             // An active candidate here was canceled by the enclosing scope or
-            // refresh. Rotate it behind the other pending snapshot candidates.
-            if let Some(active) = pass.active_candidate.take() {
-                pass.pending_candidates.push_back(active);
-            }
-            pass.pending_candidates.len()
+            // refresh. Rotate it behind its source and give the other source
+            // the next fair turn.
+            pass.candidates.resume_after_cutoff();
+            pass.candidates.len()
         };
         let mut skipped_since_yield = 0;
         let mut used_full_candidate_window = false;
@@ -1073,11 +1281,10 @@ impl DiscoveryRefresh {
                     break;
                 }
                 let node_addr = pass
-                    .pending_candidates
-                    .pop_front()
+                    .candidates
+                    .begin_next()
                     .expect("attempt limit tracks pending candidates");
                 let already_discovered = pass.discovered_keys.contains(node_addr.as_str());
-                pass.active_candidate = Some(node_addr.clone());
                 (node_addr, already_discovered)
             };
 
@@ -1088,8 +1295,8 @@ impl DiscoveryRefresh {
                     .cluster_passes
                     .get_mut(&scope_index)
                     .unwrap()
-                    .active_candidate
-                    .take();
+                    .candidates
+                    .finish_active();
                 skipped_since_yield += 1;
                 if skipped_since_yield >= DISCOVERY_SKIP_YIELD_INTERVAL {
                     skipped_since_yield = 0;
@@ -1125,24 +1332,28 @@ impl DiscoveryRefresh {
             };
             let mut progress = self.progress.lock().unwrap();
             let pass = progress.cluster_passes.get_mut(&scope_index).unwrap();
-            let active = pass
-                .active_candidate
-                .take()
-                .expect("selected cluster candidate remains active");
+            let (active, active_was_seed) = pass.candidates.finish_active();
             match result {
                 DiscoveryOutcome::Found(nodes) => pass.merge_response(nodes),
+                DiscoveryOutcome::PartialFound(_) => {
+                    unreachable!("address discovery cannot return a partial cluster union")
+                }
                 DiscoveryOutcome::AuthoritativeEmpty => {
                     pass.got_response = true;
+                    pass.saw_empty_response = true;
                 }
                 DiscoveryOutcome::Unavailable => {
                     pass.saw_unavailable = true;
                 }
                 DiscoveryOutcome::Incomplete => {
-                    pass.pending_candidates.push_back(active);
-                    return DiscoveryOutcome::Incomplete;
+                    pass.candidates
+                        .requeue_after_cutoff(active, active_was_seed);
+                    return pass.incomplete_outcome();
                 }
             }
             if scope_work_started.elapsed() >= candidate_timeout {
+                pass.candidates
+                    .alternate_after_budget_exhaustion(active_was_seed);
                 break;
             }
         }
@@ -1151,9 +1362,13 @@ impl DiscoveryRefresh {
         let complete = progress
             .cluster_passes
             .get(&scope_index)
-            .is_some_and(|pass| pass.overflowed || pass.pending_candidates.is_empty());
+            .is_some_and(|pass| pass.overflowed || pass.candidates.is_empty());
         if !complete {
-            return DiscoveryOutcome::Incomplete;
+            return progress
+                .cluster_passes
+                .get_mut(&scope_index)
+                .unwrap()
+                .incomplete_outcome();
         }
         let mut completed = progress.cluster_passes.remove(&scope_index).unwrap();
         progress.clear_address_passes(scope_index);
@@ -1167,6 +1382,15 @@ impl DiscoveryRefresh {
             .discovered
             .dedup_by(|left, right| left.as_str() == right.as_str());
         if !completed.discovered.is_empty() {
+            if completed.saw_unavailable || completed.saw_empty_response {
+                // A cluster pass is the union of independently discovered
+                // datacenters. A non-empty response from one candidate makes
+                // neither failures nor an HTTP-200 empty response from another
+                // authoritative for the complete topology. Publish a bounded
+                // union instead; a pass where every candidate returns nodes can
+                // still authoritatively remove stale entries.
+                return DiscoveryOutcome::PartialFound(completed.discovered);
+            }
             return DiscoveryOutcome::Found(completed.discovered);
         }
         if completed.got_response && !completed.saw_unavailable {
@@ -1187,26 +1411,24 @@ impl DiscoveryRefresh {
             let mut progress = self.progress.lock().unwrap();
             if !progress.scoped_passes.contains_key(&scope_index) {
                 progress.clear_address_passes(scope_index);
-                progress.scoped_passes.insert(
-                    scope_index,
+                progress.scoped_passes.insert(scope_index, {
+                    // This is a pass generation snapshot. Topology changes
+                    // from lower-priority fallback publication do not reset
+                    // it and starve later stable candidates.
+                    let (learned, seeds) = self.discovery_candidate_queues();
                     ScopedDiscoveryPass {
-                        // This is a pass generation snapshot. Topology changes
-                        // from lower-priority fallback publication do not reset
-                        // it and starve later stable candidates.
-                        pending_candidates: self.discovery_candidates().into(),
+                        candidates: DiscoveryCandidatePass::new(learned, seeds),
                         ..ScopedDiscoveryPass::default()
-                    },
-                );
+                    }
+                });
             }
         }
 
         let attempt_limit = {
             let mut progress = self.progress.lock().unwrap();
             let pass = progress.scoped_passes.get_mut(&scope_index).unwrap();
-            if let Some(active) = pass.active_candidate.take() {
-                pass.pending_candidates.push_back(active);
-            }
-            pass.pending_candidates.len()
+            pass.candidates.resume_after_cutoff();
+            pass.candidates.len()
         };
         let mut used_full_candidate_window = false;
         for _ in 0..attempt_limit {
@@ -1216,12 +1438,9 @@ impl DiscoveryRefresh {
             let node_addr = {
                 let mut progress = self.progress.lock().unwrap();
                 let pass = progress.scoped_passes.get_mut(&scope_index).unwrap();
-                let node_addr = pass
-                    .pending_candidates
-                    .pop_front()
-                    .expect("attempt limit tracks pending candidates");
-                pass.active_candidate = Some(node_addr.clone());
-                node_addr
+                pass.candidates
+                    .begin_next()
+                    .expect("attempt limit tracks pending candidates")
             };
 
             let result = if !used_full_candidate_window {
@@ -1247,39 +1466,29 @@ impl DiscoveryRefresh {
                     Err(_) => DiscoveryOutcome::Incomplete,
                 }
             };
+            if let DiscoveryOutcome::Found(nodes) = result {
+                self.progress.lock().unwrap().clear_scope(scope_index);
+                return DiscoveryOutcome::Found(nodes);
+            }
+            let mut progress = self.progress.lock().unwrap();
+            let pass = progress.scoped_passes.get_mut(&scope_index).unwrap();
+            let (active, active_was_seed) = pass.candidates.finish_active();
             match result {
-                DiscoveryOutcome::Found(nodes) => {
-                    self.progress.lock().unwrap().clear_scope(scope_index);
-                    return DiscoveryOutcome::Found(nodes);
-                }
-                DiscoveryOutcome::AuthoritativeEmpty => {
-                    let mut progress = self.progress.lock().unwrap();
-                    let pass = progress.scoped_passes.get_mut(&scope_index).unwrap();
-                    pass.active_candidate.take();
-                    pass.saw_empty_response = true;
-                }
-                DiscoveryOutcome::Unavailable => {
-                    self.progress
-                        .lock()
-                        .unwrap()
-                        .scoped_passes
-                        .get_mut(&scope_index)
-                        .unwrap()
-                        .active_candidate
-                        .take();
-                }
+                DiscoveryOutcome::AuthoritativeEmpty => pass.saw_empty_response = true,
+                DiscoveryOutcome::Unavailable => {}
                 DiscoveryOutcome::Incomplete => {
-                    let mut progress = self.progress.lock().unwrap();
-                    let pass = progress.scoped_passes.get_mut(&scope_index).unwrap();
-                    let active = pass
-                        .active_candidate
-                        .take()
-                        .expect("selected scoped candidate remains active");
-                    pass.pending_candidates.push_back(active);
+                    pass.candidates
+                        .requeue_after_cutoff(active, active_was_seed);
                     return DiscoveryOutcome::Incomplete;
                 }
+                DiscoveryOutcome::PartialFound(_) => {
+                    unreachable!("address discovery cannot return a partial cluster union")
+                }
+                DiscoveryOutcome::Found(_) => unreachable!("found result returned above"),
             }
             if scope_work_started.elapsed() >= candidate_timeout {
+                pass.candidates
+                    .alternate_after_budget_exhaustion(active_was_seed);
                 break;
             }
         }
@@ -1289,7 +1498,7 @@ impl DiscoveryRefresh {
             .scoped_passes
             .get(&scope_index)
             .unwrap()
-            .pending_candidates
+            .candidates
             .is_empty()
         {
             return DiscoveryOutcome::Incomplete;
@@ -1412,6 +1621,59 @@ impl DiscoveryRefresh {
             .await;
     }
 
+    fn merge_partial_cluster_snapshot(&self, discovered: Vec<Arc<Url>>) -> Option<Vec<Arc<Url>>> {
+        Self::merge_cluster_snapshots_with_limits(
+            discovered,
+            self.live_nodes.load().iter().cloned(),
+            MAX_CLUSTER_PASS_NODES,
+            MAX_CLUSTER_PASS_URL_BYTES,
+        )
+    }
+
+    fn merge_cluster_snapshots_with_limits(
+        discovered: Vec<Arc<Url>>,
+        current: impl IntoIterator<Item = Arc<Url>>,
+        max_nodes: usize,
+        max_url_bytes: usize,
+    ) -> Option<Vec<Arc<Url>>> {
+        let mut merged = Vec::with_capacity(discovered.len().min(max_nodes));
+        let mut seen = HashSet::new();
+        let mut url_bytes = 0usize;
+        for node in discovered {
+            if seen.contains(&node) {
+                continue;
+            }
+            if merged.len() >= max_nodes {
+                return None;
+            }
+            url_bytes = url_bytes.checked_add(node.as_str().len())?;
+            if url_bytes > max_url_bytes {
+                return None;
+            }
+            seen.insert(node.clone());
+            merged.push(node);
+        }
+        for node in current {
+            if seen.contains(&node) {
+                continue;
+            }
+            if merged.len() >= max_nodes {
+                break;
+            }
+            let Some(next_url_bytes) = url_bytes.checked_add(node.as_str().len()) else {
+                break;
+            };
+            if next_url_bytes > max_url_bytes {
+                break;
+            }
+            url_bytes = next_url_bytes;
+            seen.insert(node.clone());
+            merged.push(node);
+        }
+        merged.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        Some(merged)
+    }
+
     async fn update_live_nodes_with_timeout(&self, refresh_timeout: Duration) {
         let _ = tokio::time::timeout(
             refresh_timeout,
@@ -1422,12 +1684,12 @@ impl DiscoveryRefresh {
 
     async fn update_live_nodes_serialized(&self, refresh_timeout: Duration) {
         let _update_guard = self.update_lock.lock().await;
-        let mut scopes = Vec::new();
-        let mut scope = Some(&self.routing_scope);
-        while let Some(current) = scope {
-            scopes.push(current);
-            scope = current.fallback();
-        }
+        let Some(scopes) = self.routing_scope.scope_chain() else {
+            self.live_nodes.store(Arc::new(Vec::new()));
+            *self.published_scope_index.lock().unwrap() = None;
+            self.progress.lock().unwrap().clear_all();
+            return;
+        };
         let divisor = scopes.len();
         let scope_timeout = refresh_timeout
             .checked_div(u32::try_from(divisor).unwrap_or(u32::MAX))
@@ -1447,7 +1709,7 @@ impl DiscoveryRefresh {
             .max(Duration::from_nanos(1));
         let scope_count = scopes.len();
 
-        for (scope_index, scope) in scopes.into_iter().enumerate() {
+        for (scope_index, scope) in scopes.iter().copied().enumerate() {
             let terminal_outcome = self
                 .progress
                 .lock()
@@ -1478,6 +1740,7 @@ impl DiscoveryRefresh {
                     if **self.live_nodes.load() != new_nodes {
                         self.live_nodes.store(Arc::new(new_nodes));
                     }
+                    *self.published_scope_index.lock().unwrap() = Some(scope_index);
                     // A fallback success invalidates empty latches but must not
                     // discard unfinished higher-priority passes. Clear only
                     // this and lower-priority generations.
@@ -1485,6 +1748,19 @@ impl DiscoveryRefresh {
                         .lock()
                         .unwrap()
                         .clear_scope_and_lower_priorities(scope_index);
+                    return;
+                }
+                DiscoveryOutcome::PartialFound(discovered) => {
+                    // A cluster pass may span many bounded refreshes when old
+                    // learned nodes are blackholed. Publish an atomic union when
+                    // newly validated nodes appear so requests can recover while
+                    // the persistent pass continues pruning stale candidates.
+                    if let Some(new_nodes) = self.merge_partial_cluster_snapshot(discovered) {
+                        if **self.live_nodes.load() != new_nodes {
+                            self.live_nodes.store(Arc::new(new_nodes));
+                        }
+                        *self.published_scope_index.lock().unwrap() = Some(scope_index);
+                    }
                     return;
                 }
                 DiscoveryOutcome::AuthoritativeEmpty => {
@@ -1505,29 +1781,111 @@ impl DiscoveryRefresh {
             }
         }
 
-        let mut progress = self.progress.lock().unwrap();
-        if progress.terminal_scope_outcomes.len() == scope_count {
-            let all_scopes_conclusively_empty = progress
-                .terminal_scope_outcomes
-                .values()
-                .all(|outcome| *outcome == TerminalScopeOutcome::Empty);
-            // A mixed empty/unavailable generation preserves the old snapshot,
-            // then resets so preferred-scope recovery is not frozen.
-            if all_scopes_conclusively_empty && !self.routing_scope.is_cluster() {
-                self.live_nodes.store(Arc::new(Vec::new()));
+        let published_scope_index = *self.published_scope_index.lock().unwrap();
+        let published_strict_scope_is_empty = {
+            let mut progress = self.progress.lock().unwrap();
+            let is_empty = published_scope_index.is_some_and(|scope_index| {
+                scopes
+                    .get(scope_index)
+                    .is_some_and(|scope| !scope.is_cluster())
+                    && progress
+                        .terminal_scope_outcomes
+                        .get(&scope_index)
+                        .is_some_and(|outcome| *outcome == TerminalScopeOutcome::Empty)
+            });
+            if progress.terminal_scope_outcomes.len() == scope_count {
+                progress.clear_all();
             }
-            progress.clear_all();
+            is_empty
+        };
+        if published_strict_scope_is_empty {
+            self.live_nodes.store(Arc::new(Vec::new()));
+            *self.published_scope_index.lock().unwrap() = None;
         }
     }
 }
 
+fn is_usable_domain_name(host: &str) -> bool {
+    // `url` has already applied IDNA here, so label and total lengths are DNS
+    // wire-format ASCII lengths. Preserve one terminal root dot, but reject an
+    // empty root name and empty interior labels.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
 fn build_node_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(url::ParseError::InvalidDomainCharacter);
+    }
+    // WHATWG URL parsing removes some ASCII whitespace and decodes percent
+    // escapes before exposing the host. Discovery values are host authorities,
+    // so accepting either would silently reinterpret malformed node data.
+    if addr.contains('%')
+        || addr
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(url::ParseError::InvalidDomainCharacter);
+    }
+    if addr.ends_with(':') && addr.parse::<std::net::Ipv6Addr>().is_err() {
+        return Err(url::ParseError::InvalidPort);
+    }
     let authority = if addr.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{addr}]")
     } else {
         addr.to_string()
     };
     let mut url = Url::parse(&format!("{scheme}://{authority}"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        // Seed and `/localnodes` values are authorities, not arbitrary URLs.
+        // Accepting userinfo, paths, queries, or fragments would turn malformed
+        // discovery data into routable nodes and could alter later probes. An
+        // input port remains compatible with the established contract below:
+        // the configured Alternator port replaces it.
+        return Err(url::ParseError::InvalidDomainCharacter);
+    }
+    if matches!(url.host(), Some(Host::Domain(host)) if !is_usable_domain_name(host)) {
+        // `url` accepts several strings that cannot be DNS hostnames (empty
+        // labels, underscores, overlong labels, and edge hyphens). Publishing
+        // one would stop address fallback even though no usable node was
+        // learned from that address.
+        return Err(url::ParseError::InvalidDomainCharacter);
+    }
+    if let Some(Host::Ipv4(ip)) = url.host()
+        && addr.parse::<std::net::Ipv4Addr>().ok() != Some(ip)
+        && addr
+            .parse::<std::net::SocketAddrV4>()
+            .ok()
+            .is_none_or(|address| *address.ip() != ip)
+    {
+        // The WHATWG parser accepts legacy shorthand, octal, hexadecimal, and
+        // integer IPv4 spellings. Reject those instead of silently routing a
+        // discovery value to a canonical address it did not name explicitly.
+        return Err(url::ParseError::InvalidIpv4Address);
+    }
     url.set_port(port)
         .map_err(|()| url::ParseError::InvalidPort)?;
     Ok(url)
@@ -1557,8 +1915,8 @@ impl Drop for LiveNodes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AlternatorClient;
     use crate::config::AlternatorConfig;
+    use crate::{AlternatorClient, QueryPlan};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1669,6 +2027,7 @@ mod tests {
             status: u16,
             body: String,
         },
+        Raw(Vec<u8>),
         Redirect {
             location: String,
         },
@@ -1782,6 +2141,14 @@ mod tests {
                                     body.len()
                                 );
                                 stream.write_all(response.as_bytes()).await.unwrap();
+                            }
+                            ServerReply::Raw(body) => {
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                stream.write_all(header.as_bytes()).await.unwrap();
+                                stream.write_all(&body).await.unwrap();
                             }
                             ServerReply::Redirect { location } => {
                                 let response = format!(
@@ -1959,32 +2326,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_rejects_work_beyond_the_global_task_bound() {
-        let entries = (0..=MAX_IN_FLIGHT_DNS_LOOKUPS)
+    async fn resolver_reserves_global_capacity_for_two_seed_lookups() {
+        let learned_entries = (0..=MAX_IN_FLIGHT_LEARNED_DNS_LOOKUPS)
             .map(|index| (format!("pending-{index}.test"), vec![Resolution::Pending]))
             .collect::<Vec<_>>();
-        let inner = ScriptedResolver::new(
-            entries
-                .iter()
-                .map(|(host, answers)| (host.as_str(), answers.clone()))
-                .collect(),
-        );
+        let mut entries = learned_entries
+            .iter()
+            .map(|(host, answers)| (host.as_str(), answers.clone()))
+            .collect::<Vec<_>>();
+        entries.extend([
+            ("seed-a.test", vec![Resolution::Pending]),
+            ("seed-b.test", vec![Resolution::Pending]),
+            ("seed-overflow.test", vec![Resolution::Pending]),
+        ]);
+        let inner = ScriptedResolver::new(entries);
         let resolver = BoundedDiscoveryResolver::new(inner);
 
-        for (host, _) in entries.iter().take(MAX_IN_FLIGHT_DNS_LOOKUPS) {
+        for (host, _) in learned_entries
+            .iter()
+            .take(MAX_IN_FLIGHT_LEARNED_DNS_LOOKUPS)
+        {
             assert!(
                 tokio::time::timeout(Duration::from_millis(10), resolver.resolve(host, 8000))
                     .await
                     .is_err()
             );
         }
+        let learned_overflow = resolver
+            .resolve(&learned_entries[MAX_IN_FLIGHT_LEARNED_DNS_LOOKUPS].0, 8000)
+            .await
+            .unwrap_err();
+        assert_eq!(learned_overflow.kind(), std::io::ErrorKind::WouldBlock);
+
+        for seed in ["seed-a.test", "seed-b.test"] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), resolver.resolve_seed(seed, 8000),)
+                    .await
+                    .is_err()
+            );
+        }
         let overflow = resolver
-            .resolve(&entries[MAX_IN_FLIGHT_DNS_LOOKUPS].0, 8000)
+            .resolve_seed("seed-overflow.test", 8000)
             .await
             .unwrap_err();
 
         assert_eq!(overflow.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(resolver.in_flight_count(), MAX_IN_FLIGHT_DNS_LOOKUPS);
+        assert_eq!(resolver.peak_in_flight_count(), MAX_IN_FLIGHT_DNS_LOOKUPS);
+    }
+
+    #[tokio::test]
+    async fn saturated_learned_dns_and_stalled_seed_leave_next_seed_slot() {
+        let learned_hosts = (0..MAX_IN_FLIGHT_LEARNED_DNS_LOOKUPS)
+            .map(|index| format!("learned-{index}.test"))
+            .collect::<Vec<_>>();
+        let healthy_address = Ipv4Addr::new(127, 28, 0, 1);
+        let mut entries = learned_hosts
+            .iter()
+            .map(|host| (host.as_str(), vec![Resolution::Pending]))
+            .collect::<Vec<_>>();
+        entries.extend([
+            ("seed-a.test", vec![Resolution::Pending]),
+            (
+                "seed-b.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(healthy_address)])],
+            ),
+        ]);
+        let inner = ScriptedResolver::new(entries);
+        let resolver = Arc::new(BoundedDiscoveryResolver::new(inner));
+
+        for host in &learned_hosts {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), resolver.resolve(host, 8000))
+                    .await
+                    .is_err()
+            );
+        }
+
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["seed-a.test", "seed-b.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                nodes.resolve_node_addresses(&nodes.seed_urls[0]),
+            )
+            .await
+            .is_err()
+        );
+
+        let (_, is_domain, addresses) = tokio::time::timeout(
+            Duration::from_millis(100),
+            nodes.resolve_node_addresses(&nodes.seed_urls[1]),
+        )
+        .await
+        .expect("second retained seed was starved by learned DNS work")
+        .expect("second retained seed did not resolve");
+        assert!(is_domain);
+        assert_eq!(
+            addresses,
+            vec![SocketAddr::new(IpAddr::V4(healthy_address), 8000)]
+        );
         assert_eq!(resolver.peak_in_flight_count(), MAX_IN_FLIGHT_DNS_LOOKUPS);
     }
 
@@ -2102,6 +2548,20 @@ mod tests {
         assert!(!nodes.discovery_started.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn zero_refresh_intervals_are_clamped_away_from_a_busy_loop() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:1")
+            .active_interval(Duration::ZERO)
+            .idle_interval(Duration::ZERO)
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        assert_eq!(nodes.active_interval, MIN_DISCOVERY_REFRESH_INTERVAL);
+        assert_eq!(nodes.idle_interval, MIN_DISCOVERY_REFRESH_INTERVAL);
+    }
+
     #[tokio::test]
     async fn start_with_runtime_starts_correctly() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
@@ -2160,6 +2620,178 @@ mod tests {
 
         assert_eq!(nodes.seed_urls[0].host_str(), Some("[::1]"));
         assert_eq!(nodes.seed_urls[0].to_string(), "http://[::1]:8000/");
+    }
+
+    #[test]
+    fn node_authorities_require_usable_dns_hosts_without_losing_compatibility() {
+        let accepted = [
+            ("localhost", "localhost"),
+            ("node-a.example.", "node-a.example."),
+            ("bücher.example", "xn--bcher-kva.example"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::1", "[::1]"),
+            ("[::1]", "[::1]"),
+            ("node.example:9000", "node.example"),
+        ];
+        for (authority, expected_host) in accepted {
+            let url = build_node_url("http", authority, Some(8000)).unwrap();
+            assert_eq!(url.host_str(), Some(expected_host), "authority {authority}");
+            assert_eq!(url.port(), Some(8000), "authority {authority}");
+        }
+        assert_eq!(
+            build_node_url("HTTP", "localhost", Some(8000))
+                .unwrap()
+                .scheme(),
+            "http"
+        );
+
+        let overlong_label = format!("{}.example", "a".repeat(64));
+        let overlong_name = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        let mut rejected = vec![
+            "".to_string(),
+            ".".to_string(),
+            "bad..name".to_string(),
+            "-bad.example".to_string(),
+            "bad-.example".to_string(),
+            "bad_name.example".to_string(),
+            "[not-an-ip]".to_string(),
+            "%65xample.test".to_string(),
+            " space.test".to_string(),
+            "line\nbreak.test".to_string(),
+            "127.1".to_string(),
+            "2130706433".to_string(),
+            "0x7f000001".to_string(),
+            "0177.0.0.1".to_string(),
+            "127.0.0.1:".to_string(),
+        ];
+        rejected.extend([overlong_label, overlong_name]);
+        for authority in rejected {
+            assert!(
+                build_node_url("http", &authority, Some(8000)).is_err(),
+                "accepted unusable authority {authority:?}"
+            );
+        }
+        for scheme in ["ftp", "file", "http+unix", ""] {
+            assert!(
+                build_node_url(scheme, "localhost", Some(8000)).is_err(),
+                "accepted unsupported discovery scheme {scheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_affinity_and_preferred_plans_observe_recovered_topology() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://old-node.test:8000")
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        // This is a synchronous plan-state test; suppress lazy background
+        // startup when the plan reads the topology.
+        nodes.discovery_started.store(true, Ordering::Release);
+        let old_node = nodes.live_nodes.load()[0].clone();
+        let recovered_node = Arc::new(Url::parse("http://recovered-node.test:8000/").unwrap());
+
+        let affinity = QueryPlan::new_with_hash(nodes.clone(), 42);
+        assert_eq!(affinity.next_node().as_ref(), Some(&old_node));
+        assert!(affinity.next_node().is_none());
+        nodes
+            .live_nodes
+            .store(Arc::new(vec![recovered_node.clone()]));
+        assert_eq!(affinity.next_node().as_ref(), Some(&recovered_node));
+        assert!(affinity.next_node().is_none());
+
+        nodes.live_nodes.store(Arc::new(vec![old_node.clone()]));
+        let preferred = QueryPlan::new_with_preferred_nodes(nodes.clone(), vec![old_node.clone()]);
+        assert_eq!(preferred.next_node().as_ref(), Some(&old_node));
+        assert!(preferred.next_node().is_none());
+        nodes
+            .live_nodes
+            .store(Arc::new(vec![recovered_node.clone()]));
+        assert_eq!(preferred.next_node().as_ref(), Some(&recovered_node));
+        assert!(preferred.next_node().is_none());
+    }
+
+    #[test]
+    fn nonempty_invalid_seed_configuration_fails_closed() {
+        let invalid = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8000")
+            .seed_hosts(["bad..name", "bad_name.test", "%65xample.test"])
+            .build();
+        let nodes = LiveNodes::new(&invalid).expect("non-empty seed configuration stays enabled");
+        assert!(nodes.seed_urls.is_empty());
+        assert!(nodes.live_nodes.load().is_empty());
+        assert!(
+            nodes
+                .get_next_node_round_robin(&std::collections::HashSet::new())
+                .is_none(),
+            "malformed seeds must not fall through to the SDK endpoint"
+        );
+        let client = AlternatorClient::from_conf(invalid);
+        assert!(
+            client.config().live_nodes().is_some(),
+            "client construction must keep the fail-closed routing interceptor"
+        );
+
+        let disabled = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url("http://127.0.0.1:8000")
+            .seed_hosts(Vec::<String>::new())
+            .build();
+        assert!(LiveNodes::new(&disabled).is_none());
+    }
+
+    #[test]
+    fn cluster_anywhere_in_valid_chain_authorizes_initial_seeds() {
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["seed.test"])
+            .routing_scope(
+                RoutingScope::from_rack("dc1".to_string(), "rack1".to_string())
+                    .with_fallback(RoutingScope::from_datacenter("dc1".to_string()))
+                    .with_fallback(RoutingScope::from_cluster()),
+            )
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        assert_eq!(
+            nodes.live_nodes.load().as_slice(),
+            nodes.seed_urls.as_slice()
+        );
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn overdepth_fallback_chain_fails_closed_without_seed_authorization() {
+        let mut scope = RoutingScope::from_datacenter("dc-0".to_string());
+        for index in 1..crate::routing_scope::MAX_ROUTING_SCOPE_CHAIN_DEPTH {
+            scope = scope.with_fallback(RoutingScope::from_datacenter(format!("dc-{index}")));
+        }
+        scope = scope.with_fallback(RoutingScope::from_cluster());
+
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["seed.test"])
+            .routing_scope(scope)
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        assert_eq!(nodes.seed_urls.len(), 1);
+        assert!(nodes.live_nodes.load().is_empty());
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), None);
+        nodes.update_live_nodes().await;
+        assert!(nodes.live_nodes.load().is_empty());
     }
 
     #[tokio::test]
@@ -2277,6 +2909,14 @@ mod tests {
                 },
             ),
             (
+                "trailing-json-data",
+                ServerReply::Http {
+                    status: 200,
+                    body: r#"["poison.test"] trailing"#.to_string(),
+                },
+            ),
+            ("invalid-utf8", ServerReply::Raw(b"[\"bad\xff.test\"]".to_vec())),
+            (
                 "empty-list",
                 ServerReply::Http {
                     status: 200,
@@ -2288,6 +2928,13 @@ mod tests {
                 ServerReply::Http {
                     status: 200,
                     body: r#"["[not-an-ip]",":"]"#.to_string(),
+                },
+            ),
+            (
+                "dns-invalid-labels",
+                ServerReply::Http {
+                    status: 200,
+                    body: r#"["bad..name","-bad.test","bad-.test","bad_name.test","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test",".","%65xample.test"]"#.to_string(),
                 },
             ),
             (
@@ -2451,7 +3098,7 @@ mod tests {
             vec![(
                 address,
                 vec![ExpectedReply::json(
-                    r#"["[not-an-ip]","learned.internal",":","learned.internal"]"#,
+                    r#"["[not-an-ip]","learned.internal",":","learned.internal","user@ignored.test","ignored.test/path","ignored.test?query","ignored.test#fragment"]"#,
                 )],
             )],
         )
@@ -3511,6 +4158,417 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_cluster_refresh_preserves_unavailable_datacenter_lkg() {
+        let learned_a = Ipv4Addr::new(127, 25, 0, 1);
+        let learned_b = Ipv4Addr::new(127, 25, 0, 2);
+        let seed_a = Ipv4Addr::new(127, 25, 0, 3);
+        let seed_b = Ipv4Addr::new(127, 25, 0, 4);
+        let (port, servers) = start_address_servers(
+            "unused.test",
+            vec![
+                (
+                    learned_a,
+                    vec![
+                        ExpectedReply::json(r#"["new-dc-a.test"]"#).for_host(learned_a.to_string()),
+                    ],
+                ),
+                (
+                    learned_b,
+                    vec![
+                        ExpectedReply::for_path("/localnodes", ServerReply::Reset)
+                            .for_host(learned_b.to_string()),
+                    ],
+                ),
+                (
+                    seed_a,
+                    vec![ExpectedReply::json(r#"["new-dc-a.test"]"#).for_host(seed_a.to_string())],
+                ),
+                (
+                    seed_b,
+                    vec![
+                        ExpectedReply::for_path("/localnodes", ServerReply::Reset)
+                            .for_host(seed_b.to_string()),
+                    ],
+                ),
+            ],
+        )
+        .await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            // Each seed represents one datacenter. DC-A remains discoverable,
+            // while DC-B has a transiently unavailable discovery path.
+            .seed_hosts([seed_a.to_string(), seed_b.to_string()])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        nodes.live_nodes.store(Arc::new(vec![
+            Arc::new(Url::parse(&format!("http://{learned_a}:{port}/")).unwrap()),
+            Arc::new(Url::parse(&format!("http://{learned_b}:{port}/")).unwrap()),
+        ]));
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        let hosts = nodes
+            .live_nodes
+            .load()
+            .iter()
+            .map(|node| node.host_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts,
+            vec![
+                "127.25.0.1".to_string(),
+                "127.25.0.2".to_string(),
+                "new-dc-a.test".to_string(),
+            ],
+            "a partial cluster refresh must atomically union validated nodes with every unavailable datacenter's last-known-good coverage"
+        );
+        assert!(nodes.progress.lock().unwrap().cluster_passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_http_empty_mixed_with_fresh_merges_last_known_good() {
+        let fresh_address = Ipv4Addr::new(127, 27, 0, 1);
+        let empty_address = Ipv4Addr::new(127, 27, 0, 2);
+        let (port, servers) = start_address_servers(
+            "unused.test",
+            vec![
+                (
+                    fresh_address,
+                    vec![
+                        ExpectedReply::json(r#"["fresh.test"]"#)
+                            .for_host(fresh_address.to_string()),
+                    ],
+                ),
+                (
+                    empty_address,
+                    vec![ExpectedReply::json("[]").for_host(empty_address.to_string())],
+                ),
+            ],
+        )
+        .await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts([fresh_address.to_string(), empty_address.to_string()])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+
+        let hosts = nodes
+            .live_nodes
+            .load()
+            .iter()
+            .map(|node| node.host_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts,
+            vec![
+                fresh_address.to_string(),
+                empty_address.to_string(),
+                "fresh.test".to_string(),
+            ]
+        );
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn exhausted_application_plan_recovers_through_seed_to_a_new_live_node() {
+        let seed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = seed_listener.local_addr().unwrap().port();
+        let old_listener = TcpListener::bind(format!("127.0.0.2:{port}"))
+            .await
+            .unwrap();
+        let recovered_listener = TcpListener::bind(format!("127.0.0.3:{port}"))
+            .await
+            .unwrap();
+
+        let seed_server = tokio::spawn(async move {
+            for body in [r#"["127.0.0.2"]"#, r#"["127.0.0.3"]"#] {
+                let (mut stream, _) = seed_listener.accept().await.unwrap();
+                let request = read_request_headers(&mut stream).await;
+                assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let old_server = tokio::spawn(async move {
+            let (mut application, _) = old_listener.accept().await.unwrap();
+            let request = read_request_headers(&mut application).await;
+            assert!(request.starts_with("POST / HTTP/1.1"));
+            // Closing without a response exhausts the only node in this
+            // operation's original query plan.
+            drop(application);
+
+            let (mut discovery, _) = old_listener.accept().await.unwrap();
+            let request = read_request_headers(&mut discovery).await;
+            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+            drop(discovery);
+        });
+        let recovered_server = tokio::spawn(async move {
+            let (mut stream, _) = recovered_listener.accept().await.unwrap();
+            let request = read_request_headers(&mut stream).await;
+            assert!(request.starts_with("POST / HTTP/1.1"));
+            let body = r#"{"TableNames":[]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        nodes.discovery_started.store(true, Ordering::Release);
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("127.0.0.2"));
+        let client = AlternatorClient::from_conf_with_live_nodes(config, nodes.clone());
+
+        assert!(client.list_tables().send().await.is_err());
+        nodes.update_live_nodes().await;
+        assert!(
+            nodes
+                .live_nodes
+                .load()
+                .iter()
+                .any(|node| node.host_str() == Some("127.0.0.3")),
+            "seed recovery did not publish the newly discovered node"
+        );
+        client.list_tables().send().await.unwrap();
+
+        for server in [seed_server, old_server, recovered_server] {
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .expect("recovery server did not receive its expected requests")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_learned_nodes_cannot_starve_original_seed_recovery() {
+        let stalled_address = Ipv4Addr::new(127, 23, 0, 1);
+        let seed_address = Ipv4Addr::new(127, 23, 0, 2);
+        let first_entered = Arc::new(Notify::new());
+        let first_disconnected = Arc::new(Notify::new());
+        let second_entered = Arc::new(Notify::new());
+        let second_disconnected = Arc::new(Notify::new());
+        let (port, servers) = start_address_servers(
+            "unused.test",
+            vec![
+                (
+                    stalled_address,
+                    vec![
+                        ExpectedReply::for_path(
+                            "/localnodes?dc=dc1",
+                            ServerReply::WaitForDisconnect {
+                                entered: first_entered.clone(),
+                                disconnected: first_disconnected.clone(),
+                            },
+                        )
+                        .for_host("learned-a.test"),
+                        ExpectedReply::for_path(
+                            "/localnodes?dc=dc1",
+                            ServerReply::WaitForDisconnect {
+                                entered: second_entered.clone(),
+                                disconnected: second_disconnected.clone(),
+                            },
+                        )
+                        .for_host("learned-b.test"),
+                    ],
+                ),
+                (
+                    seed_address,
+                    vec![
+                        ExpectedReply::for_path(
+                            "/localnodes?dc=dc1",
+                            ServerReply::Http {
+                                status: 200,
+                                body: r#"["recovered.test"]"#.to_string(),
+                            },
+                        )
+                        .for_host("seed.test"),
+                    ],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![
+            (
+                "learned-a.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(stalled_address)])],
+            ),
+            (
+                "learned-b.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(stalled_address)])],
+            ),
+            (
+                "seed.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(seed_address)])],
+            ),
+        ]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["seed.test"])
+            .routing_scope(RoutingScope::from_datacenter("dc1".to_string()))
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver.clone());
+        nodes.live_nodes.store(Arc::new(vec![
+            Arc::new(Url::parse(&format!("http://learned-a.test:{port}/")).unwrap()),
+            Arc::new(Url::parse(&format!("http://learned-b.test:{port}/")).unwrap()),
+        ]));
+        let refresh = nodes.refresh_context();
+
+        refresh
+            .update_live_nodes_with_timeout(Duration::from_millis(250))
+            .await;
+        tokio::time::timeout(Duration::from_millis(200), first_entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(200), first_disconnected.notified())
+            .await
+            .unwrap();
+        refresh
+            .update_live_nodes_with_timeout(Duration::from_millis(250))
+            .await;
+
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+
+        assert_eq!(resolver.calls_for("seed.test"), 1);
+        assert_eq!(nodes.live_nodes.load().len(), 1);
+        assert_eq!(
+            nodes.live_nodes.load()[0].host_str(),
+            Some("recovered.test")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_entered.notified())
+                .await
+                .is_err(),
+            "another stalled learned node ran before the recovery seed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_disconnected.notified())
+                .await
+                .is_err(),
+            "unexpected second stalled learned-node connection completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_recovery_publishes_valid_partial_union_before_stale_pass_finishes() {
+        let stalled_address = Ipv4Addr::new(127, 24, 0, 1);
+        let seed_address = Ipv4Addr::new(127, 24, 0, 2);
+        let first_entered = Arc::new(Notify::new());
+        let first_disconnected = Arc::new(Notify::new());
+        let second_entered = Arc::new(Notify::new());
+        let second_disconnected = Arc::new(Notify::new());
+        let (port, servers) = start_address_servers(
+            "unused.test",
+            vec![
+                (
+                    stalled_address,
+                    vec![
+                        ExpectedReply::for_path(
+                            "/localnodes",
+                            ServerReply::WaitForDisconnect {
+                                entered: first_entered.clone(),
+                                disconnected: first_disconnected.clone(),
+                            },
+                        )
+                        .for_host("learned-a.test"),
+                        ExpectedReply::for_path(
+                            "/localnodes",
+                            ServerReply::WaitForDisconnect {
+                                entered: second_entered.clone(),
+                                disconnected: second_disconnected.clone(),
+                            },
+                        )
+                        .for_host("learned-b.test"),
+                    ],
+                ),
+                (
+                    seed_address,
+                    vec![ExpectedReply::json(r#"["recovered.test"]"#).for_host("seed.test")],
+                ),
+            ],
+        )
+        .await;
+        let resolver = ScriptedResolver::new(vec![
+            (
+                "learned-a.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(stalled_address)])],
+            ),
+            (
+                "learned-b.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(stalled_address)])],
+            ),
+            (
+                "seed.test",
+                vec![Resolution::Addresses(vec![IpAddr::V4(seed_address)])],
+            ),
+        ]);
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["seed.test"])
+            .build();
+        let nodes = live_nodes_with_resolver(&config, resolver);
+        nodes.live_nodes.store(Arc::new(vec![
+            Arc::new(Url::parse(&format!("http://learned-a.test:{port}/")).unwrap()),
+            Arc::new(Url::parse(&format!("http://learned-b.test:{port}/")).unwrap()),
+        ]));
+        let refresh = nodes.refresh_context();
+
+        refresh
+            .update_live_nodes_with_timeout(Duration::from_millis(250))
+            .await;
+        tokio::time::timeout(Duration::from_millis(200), first_entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(200), first_disconnected.notified())
+            .await
+            .unwrap();
+        refresh
+            .update_live_nodes_with_timeout(Duration::from_millis(250))
+            .await;
+        tokio::time::timeout(Duration::from_millis(200), second_entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(200), second_disconnected.notified())
+            .await
+            .unwrap();
+
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+
+        assert!(
+            nodes
+                .live_nodes
+                .load()
+                .iter()
+                .any(|node| node.host_str() == Some("recovered.test"))
+        );
+    }
+
+    #[tokio::test]
     async fn partial_scoped_failure_uses_reachable_learned_node_without_seed() {
         let live_address = Ipv4Addr::new(127, 0, 0, 45);
         let unavailable_address = Ipv4Addr::new(127, 0, 0, 46);
@@ -3559,6 +4617,89 @@ mod tests {
             Some("live-node.test")
         );
         assert_eq!(resolver.calls_for("entry.test"), 0);
+    }
+
+    async fn assert_authoritative_empty_clears_only_exact_scope_origin(
+        routing_scope: RoutingScope,
+        primary_path: &str,
+        fallback_path: &str,
+    ) {
+        let address = Ipv4Addr::new(127, 26, 0, 1);
+        let found_body = format!(r#"["{address}"]"#);
+        let empty = || ServerReply::Http {
+            status: 200,
+            body: "[]".to_string(),
+        };
+        let found = || ServerReply::Http {
+            status: 200,
+            body: found_body.clone(),
+        };
+        let (port, servers) = start_address_servers(
+            "unused.test",
+            vec![(
+                address,
+                vec![
+                    ExpectedReply::for_path(primary_path, found()).for_host(address.to_string()),
+                    ExpectedReply::for_path(primary_path, empty()).for_host(address.to_string()),
+                    ExpectedReply::for_path(fallback_path, ServerReply::Reset)
+                        .for_host(address.to_string()),
+                    ExpectedReply::for_path(primary_path, empty()).for_host(address.to_string()),
+                    ExpectedReply::for_path(fallback_path, found()).for_host(address.to_string()),
+                    ExpectedReply::for_path(primary_path, empty()).for_host(address.to_string()),
+                    ExpectedReply::for_path(fallback_path, ServerReply::Reset)
+                        .for_host(address.to_string()),
+                ],
+            )],
+        )
+        .await;
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts([address.to_string()])
+            .routing_scope(routing_scope)
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load().len(), 1);
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), Some(0));
+
+        nodes.update_live_nodes().await;
+        assert!(nodes.live_nodes.load().is_empty());
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), None);
+
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load().len(), 1);
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), Some(1));
+
+        nodes.update_live_nodes().await;
+        join_servers(servers).await;
+        assert_eq!(nodes.live_nodes.load().len(), 1);
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn datacenter_empty_clears_only_same_datacenter_snapshot() {
+        assert_authoritative_empty_clears_only_exact_scope_origin(
+            RoutingScope::from_datacenter("primary".to_string())
+                .with_fallback(RoutingScope::from_datacenter("fallback".to_string())),
+            "/localnodes?dc=primary",
+            "/localnodes?dc=fallback",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rack_empty_clears_only_same_rack_snapshot() {
+        assert_authoritative_empty_clears_only_exact_scope_origin(
+            RoutingScope::from_rack("dc1".to_string(), "primary".to_string()).with_fallback(
+                RoutingScope::from_rack("dc1".to_string(), "fallback".to_string()),
+            ),
+            "/localnodes?dc=dc1&rack=primary",
+            "/localnodes?dc=dc1&rack=fallback",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3671,6 +4812,7 @@ mod tests {
         let nodes = LiveNodes::new(&config).unwrap();
         let retained = nodes.seed_urls[0].clone();
         nodes.live_nodes.store(Arc::new(vec![retained.clone()]));
+        *nodes.published_scope_index.lock().unwrap() = Some(0);
         let refresh = nodes.refresh_context();
 
         assert!(
@@ -3766,6 +4908,7 @@ mod tests {
         let nodes = LiveNodes::new(&config).unwrap();
         let retained = nodes.seed_urls[0].clone();
         nodes.live_nodes.store(Arc::new(vec![retained.clone()]));
+        *nodes.published_scope_index.lock().unwrap() = Some(0);
         let refresh = nodes.refresh_context();
 
         refresh
@@ -3777,7 +4920,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), disconnected.notified())
             .await
             .unwrap();
-        assert_eq!(nodes.live_nodes.load().as_slice(), &[retained]);
+        assert!(
+            nodes.live_nodes.load().is_empty(),
+            "the exact primary-scope snapshot must clear once that scope is authoritatively empty"
+        );
         assert!(
             nodes
                 .progress
@@ -4086,6 +5232,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_cluster_fallback_authorizes_seed_before_discovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let application_posts = Arc::new(AtomicUsize::new(0));
+        let task_posts = application_posts.clone();
+        let server = tokio::spawn(async move {
+            for expected in ["application", "scoped", "cluster", "application"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request_headers(&mut stream).await;
+                let (content_type, body) = match expected {
+                    "scoped" => {
+                        assert!(request.starts_with("GET /localnodes?dc=missing HTTP/1.1"));
+                        ("application/json", "[]".to_string())
+                    }
+                    "cluster" => {
+                        assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+                        ("application/json", format!(r#"["{}"]"#, address.ip()))
+                    }
+                    "application" => {
+                        assert!(request.starts_with("POST / HTTP/1.1"));
+                        task_posts.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "application/x-amz-json-1.0",
+                            r#"{"TableNames":[]}"#.to_string(),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .endpoint_url(format!("http://{address}"))
+            .routing_scope(
+                RoutingScope::from_datacenter("missing".to_string())
+                    .with_fallback(RoutingScope::from_cluster()),
+            )
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        assert_eq!(
+            nodes.live_nodes.load().as_slice(),
+            nodes.seed_urls.as_slice()
+        );
+        assert_eq!(*nodes.published_scope_index.lock().unwrap(), Some(1));
+        nodes.discovery_started.store(true, Ordering::Release);
+        let client = AlternatorClient::from_conf_with_live_nodes(config, nodes.clone());
+
+        client.list_tables().send().await.unwrap();
+        assert_eq!(application_posts.load(Ordering::SeqCst), 1);
+
+        nodes.update_live_nodes().await;
+        assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("127.0.0.1"));
+        client.list_tables().send().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server did not receive fallback discovery and application requests")
+            .unwrap();
+        assert_eq!(application_posts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn invalid_first_seed_does_not_block_another_configured_seed() {
         let invalid_address = Ipv4Addr::new(127, 0, 0, 49);
         let valid_address = Ipv4Addr::new(127, 0, 0, 50);
@@ -4287,6 +5501,64 @@ mod tests {
         assert!(!pass.overflowed);
         assert!(MAX_CLUSTER_PASS_NODES > learned.len());
         assert_eq!(DISCOVERY_REFRESH_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn seed_and_topology_accumulator_rejects_instead_of_truncating_overflow() {
+        let first = Arc::new(Url::parse("http://first.test:8000/").unwrap());
+        let second = Arc::new(Url::parse("http://second.test:8000/").unwrap());
+        let third = Arc::new(Url::parse("http://third.test:8000/").unwrap());
+        let mut nodes = Vec::new();
+        let mut keys = HashSet::new();
+        let mut url_bytes = 0usize;
+
+        assert_eq!(
+            push_unique_node_with_limits(
+                &mut nodes,
+                &mut keys,
+                &mut url_bytes,
+                first.clone(),
+                2,
+                1_000,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            push_unique_node_with_limits(&mut nodes, &mut keys, &mut url_bytes, first, 2, 1_000,),
+            Some(false),
+            "duplicates must not consume a configured-seed slot"
+        );
+        assert_eq!(
+            push_unique_node_with_limits(&mut nodes, &mut keys, &mut url_bytes, second, 2, 1_000,),
+            Some(true)
+        );
+        assert_eq!(
+            push_unique_node_with_limits(
+                &mut nodes,
+                &mut keys,
+                &mut url_bytes,
+                third.clone(),
+                2,
+                1_000,
+            ),
+            None
+        );
+        assert_eq!(nodes.len(), 2, "overflow must not publish a prefix");
+
+        let existing_bytes = url_bytes;
+        assert_eq!(
+            push_unique_node_with_limits(
+                &mut nodes,
+                &mut keys,
+                &mut url_bytes,
+                third,
+                3,
+                existing_bytes,
+            ),
+            None
+        );
+        assert_eq!(url_bytes, existing_bytes);
+        assert_eq!(nodes.len(), 2);
     }
 
     #[tokio::test]
@@ -4517,10 +5789,14 @@ mod tests {
         let _ = stalled_server.await;
         join_servers(servers).await;
 
-        assert_eq!(nodes.live_nodes.load().len(), 1);
-        assert_eq!(
-            nodes.live_nodes.load()[0].host_str(),
-            Some("reachable.test")
+        assert_eq!(nodes.live_nodes.load().len(), 3);
+        assert!(
+            nodes
+                .live_nodes
+                .load()
+                .iter()
+                .any(|node| node.host_str() == Some("reachable.test")),
+            "the reachable candidate was not merged into the retained snapshot"
         );
     }
 
@@ -4595,10 +5871,14 @@ mod tests {
             .await;
         join_servers(servers).await;
 
-        assert_eq!(nodes.live_nodes.load().len(), 1);
-        assert_eq!(
-            nodes.live_nodes.load()[0].host_str(),
-            Some("tail-success.test")
+        assert_eq!(nodes.live_nodes.load().len(), 3);
+        assert!(
+            nodes
+                .live_nodes
+                .load()
+                .iter()
+                .any(|node| node.host_str() == Some("tail-success.test")),
+            "the tail candidate was not merged into the retained snapshot"
         );
     }
 
@@ -4618,7 +5898,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut pass = ClusterDiscoveryPass {
-            pending_candidates: candidates.clone().into(),
+            candidates: DiscoveryCandidatePass::new(candidates.clone().into(), VecDeque::new()),
             ..ClusterDiscoveryPass::default()
         };
         pass.merge_response(candidates);
@@ -4648,6 +5928,89 @@ mod tests {
 
         assert_eq!(discovered.len(), 20_000);
         assert!(scheduler_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn partial_cluster_merge_keeps_fresh_nodes_and_only_fitting_old_prefix() {
+        use std::cell::Cell;
+
+        let first = Arc::new(Url::parse("http://first.test:8000/").unwrap());
+        let second = Arc::new(Url::parse("http://second.test:8000/").unwrap());
+        let third = Arc::new(Url::parse("http://third.test:8000/").unwrap());
+
+        let merged = DiscoveryRefresh::merge_cluster_snapshots_with_limits(
+            vec![second.clone()],
+            vec![first.clone(), second.clone()],
+            2,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(merged, vec![first.clone(), second.clone()]);
+        let node_limited = DiscoveryRefresh::merge_cluster_snapshots_with_limits(
+            vec![third.clone()],
+            merged.clone(),
+            2,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(node_limited, vec![first.clone(), third]);
+
+        let byte_limited = DiscoveryRefresh::merge_cluster_snapshots_with_limits(
+            vec![second.clone()],
+            vec![first.clone()],
+            2,
+            merged.iter().map(|node| node.as_str().len()).sum::<usize>() - 1,
+        )
+        .unwrap();
+        assert_eq!(byte_limited, vec![second]);
+
+        let consumed = Cell::new(0usize);
+        let current_first = first.clone();
+        let consumed_ref = &consumed;
+        let oversized_current = (0..100).map(move |index| {
+            consumed_ref.set(consumed_ref.get() + 1);
+            if index == 0 {
+                current_first.clone()
+            } else {
+                Arc::new(Url::parse(&format!("http://overflow-{index}.test:8000/")).unwrap())
+            }
+        });
+        let prefix_only = DiscoveryRefresh::merge_cluster_snapshots_with_limits(
+            vec![first.clone()],
+            oversized_current,
+            1,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(prefix_only, vec![first]);
+        assert_eq!(
+            consumed.get(),
+            2,
+            "bounded merge consumed nodes after the first proven overflow"
+        );
+    }
+
+    #[test]
+    fn cluster_partial_publication_repeats_when_new_nodes_are_validated() {
+        let first = Arc::new(Url::parse("http://first.test:8000/").unwrap());
+        let second = Arc::new(Url::parse("http://second.test:8000/").unwrap());
+        let mut pass = ClusterDiscoveryPass::default();
+
+        pass.merge_response(vec![first.clone()]);
+        match pass.incomplete_outcome() {
+            DiscoveryOutcome::PartialFound(nodes) => assert_eq!(nodes, vec![first.clone()]),
+            outcome => panic!("expected first partial publication, got {outcome:?}"),
+        }
+        assert!(matches!(
+            pass.incomplete_outcome(),
+            DiscoveryOutcome::Incomplete
+        ));
+
+        pass.merge_response(vec![second.clone()]);
+        match pass.incomplete_outcome() {
+            DiscoveryOutcome::PartialFound(nodes) => assert_eq!(nodes, vec![first, second]),
+            outcome => panic!("expected updated partial publication, got {outcome:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4830,9 +6193,13 @@ mod tests {
         nodes.update_live_nodes().await;
 
         server.await.unwrap();
-        assert_eq!(
-            nodes.live_nodes.load()[0].as_str(),
-            format!("http://[::1]:{port}/")
+        assert!(
+            nodes
+                .live_nodes
+                .load()
+                .iter()
+                .any(|node| node.as_str() == format!("http://[::1]:{port}/")),
+            "raw IPv6 seed recovery did not publish the recovered node"
         );
     }
 

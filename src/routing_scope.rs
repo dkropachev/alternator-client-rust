@@ -17,11 +17,14 @@
 //! Routing scopes allow user to specify which nodes should be used for load balancing,
 //! with optional fallback to a wider scope if no nodes are available in the preferred one.
 
+pub(crate) const MAX_ROUTING_SCOPE_CHAIN_DEPTH: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingScope {
     dc: Option<String>,
     rack: Option<String>,
     fallback: Option<Box<RoutingScope>>,
+    fallback_chain_valid: bool,
 }
 
 impl RoutingScope {
@@ -36,6 +39,7 @@ impl RoutingScope {
             dc: None,
             rack: None,
             fallback: None,
+            fallback_chain_valid: true,
         }
     }
 
@@ -74,12 +78,36 @@ impl RoutingScope {
     /// previous one, e.g., (rack -> datacenter -> cluster) or (rack -> another rack -> datacenter -> cluster).
     /// Making a fallback narrower, e.g., (datacenter -> rack) or (cluster -> datacenter),
     /// may be redundant if the set of nodes in the next scope is a subset of the previous one.
+    /// Fallback chains are limited to 16 scopes. An append that would exceed
+    /// that bound invalidates the chain so client-side routing fails closed.
     pub fn with_fallback(mut self, new_fallback: RoutingScope) -> Self {
-        let mut tail = &mut self.fallback;
-        while let Some(boxed) = tail {
-            tail = &mut boxed.fallback;
+        let Some(current_depth) = self.scope_chain().map(|chain| chain.len()) else {
+            self.fallback_chain_valid = false;
+            return self;
+        };
+        let Some(new_depth) = new_fallback.scope_chain().map(|chain| chain.len()) else {
+            self.fallback_chain_valid = false;
+            return self;
+        };
+        if current_depth
+            .checked_add(new_depth)
+            .is_none_or(|depth| depth > MAX_ROUTING_SCOPE_CHAIN_DEPTH)
+        {
+            // The API predates fallible builders. Preserve its signature but
+            // remember that the requested chain was rejected so discovery can
+            // fail closed instead of silently authorizing a shorter chain.
+            self.fallback_chain_valid = false;
+            return self;
         }
-        *tail = Some(Box::new(new_fallback));
+
+        let mut tail = &mut self;
+        for _ in 1..current_depth {
+            tail = tail
+                .fallback
+                .as_deref_mut()
+                .expect("validated fallback depth has a next scope");
+        }
+        tail.fallback = Some(Box::new(new_fallback));
         self
     }
 
@@ -113,6 +141,19 @@ impl RoutingScope {
 
     pub fn rack(&self) -> Option<&str> {
         self.rack.as_deref()
+    }
+
+    pub(crate) fn scope_chain(&self) -> Option<Vec<&RoutingScope>> {
+        let mut chain = Vec::with_capacity(MAX_ROUTING_SCOPE_CHAIN_DEPTH);
+        let mut current = Some(self);
+        while let Some(scope) = current {
+            if !scope.fallback_chain_valid || chain.len() >= MAX_ROUTING_SCOPE_CHAIN_DEPTH {
+                return None;
+            }
+            chain.push(scope);
+            current = scope.fallback.as_deref();
+        }
+        Some(chain)
     }
 }
 
@@ -246,5 +287,20 @@ mod tests {
         assert_eq!(chain1, chain2);
         assert_eq!(chain2, chain3);
         assert_eq!(chain3, chain4);
+    }
+
+    #[test]
+    fn fallback_depth_boundary_is_bounded_and_overflow_is_invalid() {
+        let mut boundary = RoutingScope::from_datacenter("dc-0".to_string());
+        for index in 1..MAX_ROUTING_SCOPE_CHAIN_DEPTH {
+            boundary = boundary.with_fallback(RoutingScope::from_datacenter(format!("dc-{index}")));
+        }
+        assert_eq!(
+            boundary.scope_chain().unwrap().len(),
+            MAX_ROUTING_SCOPE_CHAIN_DEPTH
+        );
+
+        let overflow = boundary.with_fallback(RoutingScope::from_cluster());
+        assert!(overflow.scope_chain().is_none());
     }
 }
