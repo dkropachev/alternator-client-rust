@@ -935,6 +935,11 @@ async fn describe_table_called_exactly_once_without_config() {
         .with_type(KeyRouteAffinityType::AnyWrite)
         .build();
     let client = create_client_with_scope_and_affinity(cluster, scope.clone(), affinity_config);
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
     create_table(&client, &table_name).await;
 
     assert_eq!(request_counter.total_describe_tables(), 0);
@@ -991,6 +996,11 @@ async fn describe_table_not_called_with_config() {
         .with_pk_info(&table_name, "id")
         .build();
     let client = create_client_with_scope_and_affinity(cluster, scope.clone(), affinity_config);
+    wait_until_live_nodes_match(
+        &client,
+        scope_utils::working_nodes_ips_in_scope(cluster, &scope),
+    )
+    .await;
     create_table(&client, &table_name).await;
 
     assert_eq!(request_counter.total_describe_tables(), 0);
