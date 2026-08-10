@@ -44,13 +44,11 @@ enum QueryPlanState {
         // Boxed to prevent "large size difference between variants" warning
         go_rand: Box<GoRand>,
         remaining_nodes: Option<Vec<Arc<Url>>>,
-        used_nodes: HashSet<Arc<Url>>,
     },
     /// Deterministic order with selected nodes before the rest.
     PreferredNodes {
         preferred_nodes: Vec<Arc<Url>>,
         remaining_nodes: Option<VecDeque<Arc<Url>>>,
-        used_nodes: HashSet<Arc<Url>>,
     },
 }
 
@@ -76,7 +74,6 @@ impl QueryPlan {
             state: Mutex::new(QueryPlanState::Affinity {
                 go_rand: Box::new(GoRand::new(seed as i64)),
                 remaining_nodes: None,
-                used_nodes: HashSet::new(),
             }),
         }
     }
@@ -92,7 +89,6 @@ impl QueryPlan {
             state: Mutex::new(QueryPlanState::PreferredNodes {
                 preferred_nodes,
                 remaining_nodes: None,
-                used_nodes: HashSet::new(),
             }),
         }
     }
@@ -121,17 +117,12 @@ impl QueryPlan {
             QueryPlanState::Affinity {
                 go_rand,
                 remaining_nodes,
-                used_nodes,
             } => {
-                if remaining_nodes.as_ref().is_none_or(Vec::is_empty) {
+                let remaining = remaining_nodes.get_or_insert_with(|| {
                     let mut nodes = self.live_nodes.get_live_nodes();
                     sort_node_urls(&mut nodes);
-                    nodes.retain(|node| !used_nodes.contains(node));
-                    *remaining_nodes = Some(nodes);
-                }
-                let remaining = remaining_nodes
-                    .as_mut()
-                    .expect("affinity nodes were initialized above");
+                    nodes
+                });
 
                 if remaining.is_empty() {
                     return None;
@@ -144,19 +135,16 @@ impl QueryPlan {
 
                 remaining[idx] = remaining[last_idx].clone();
                 remaining.pop();
-                used_nodes.insert(selected_node.clone());
 
                 Some(selected_node)
             }
             QueryPlanState::PreferredNodes {
                 preferred_nodes,
                 remaining_nodes,
-                used_nodes,
             } => {
-                if remaining_nodes.as_ref().is_none_or(VecDeque::is_empty) {
+                let remaining = remaining_nodes.get_or_insert_with(|| {
                     let mut nodes = self.live_nodes.get_live_nodes();
                     sort_node_urls(&mut nodes);
-                    nodes.retain(|node| !used_nodes.contains(node));
 
                     let mut ordered = VecDeque::with_capacity(nodes.len());
                     for preferred_node in preferred_nodes.iter() {
@@ -165,15 +153,10 @@ impl QueryPlan {
                         }
                     }
                     ordered.extend(nodes);
-                    *remaining_nodes = Some(ordered);
-                }
-                let remaining = remaining_nodes
-                    .as_mut()
-                    .expect("preferred nodes were initialized above");
+                    ordered
+                });
 
-                let selected = remaining.pop_front()?;
-                used_nodes.insert(selected.clone());
-                Some(selected)
+                remaining.pop_front()
             }
         }
     }

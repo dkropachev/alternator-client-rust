@@ -153,10 +153,9 @@ impl Intercept for AlternatorInterceptor {
         cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         // Take the next node from the query plan and override the request URI.
-        if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>() {
-            let next_node = query_plan.next_node().ok_or_else(|| -> BoxError {
-                "Alternator query plan exhausted: no validated live nodes are available".into()
-            })?;
+        if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>()
+            && let Some(next_node) = query_plan.next_node()
+        {
             let request = context.request_mut();
             let mut current = url::Url::parse(request.uri())?;
             current
