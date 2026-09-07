@@ -640,6 +640,15 @@ mod tests {
             ],
         )
         .await;
+        assert_dns_discovery(
+            "127.0.0.1:0",
+            &[
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -697,6 +706,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refresh_recovers_through_all_original_dns_seed_addresses() {
+        let (port, server) =
+            start_localnodes_server_on("127.0.0.1:0", "dual.test", r#"["recovered.internal"]"#)
+                .await;
+        let nodes = dns_live_nodes(
+            port,
+            &[
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ],
+        );
+        nodes.live_nodes.store(Arc::new(vec![Arc::new(
+            Url::parse(&format!("http://127.0.0.3:{port}/")).unwrap(),
+        )]));
+
+        nodes.update_live_nodes().await;
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("recovery never reached a usable seed address")
+            .unwrap();
+        assert_eq!(
+            nodes.live_nodes.load()[0].as_str(),
+            format!("http://recovered.internal:{port}/")
+        );
+    }
+
     async fn assert_dns_discovery(bind_address: &str, resolved_ips: &[IpAddr]) {
         let (port, server) =
             start_localnodes_server_on(bind_address, "dual.test", r#"["dual.test"]"#).await;
@@ -704,7 +741,10 @@ mod tests {
 
         nodes.update_live_nodes().await;
 
-        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("discovery never reached a usable seed address")
+            .unwrap();
         assert_eq!(nodes.live_nodes.load()[0].host_str(), Some("dual.test"));
     }
 
