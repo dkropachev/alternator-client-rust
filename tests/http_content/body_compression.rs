@@ -451,7 +451,7 @@ pub async fn test_disabled_by_per_request_customization(ctx: &mut HttpTestContex
 // responses based on the Content-Encoding header, independent of whether
 // the client requested compression via Accept-Encoding.
 //
-// Server setup (configured in docker-compose.yml):
+// Server setup (configured by the Makefile's CCM cluster):
 //   - ScyllaDB 2026.1.0+ with Alternator enabled
 //   - --alternator-response-gzip-compression-level 6
 //   - --alternator-response-compression-threshold-in-bytes 1
