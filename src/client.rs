@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::live_nodes::LiveNodesBuildError;
 use crate::*;
 
 /// Alternator driver's client
@@ -31,6 +32,7 @@ use crate::*;
 /// let config =
 ///     AlternatorConfig::builder()
 ///    .behavior_version_latest()
+///    .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
 ///
@@ -49,8 +51,77 @@ pub struct AlternatorClient {
     dynamodb_client: aws_sdk_dynamodb::Client,
     config: AlternatorConfig,
 }
+
+/// Error returned when an [`AlternatorClient`] cannot be constructed safely.
+#[derive(Debug)]
+pub struct AlternatorClientBuildError {
+    kind: AlternatorClientBuildErrorKind,
+}
+
+#[derive(Debug)]
+enum AlternatorClientBuildErrorKind {
+    MissingBehaviorVersion,
+    LiveNodes(LiveNodesBuildError),
+}
+
+impl std::fmt::Display for AlternatorClientBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            AlternatorClientBuildErrorKind::MissingBehaviorVersion => formatter.write_str(
+                "an AWS SDK behavior version must be set before constructing an Alternator client",
+            ),
+            AlternatorClientBuildErrorKind::LiveNodes(source) => {
+                write!(
+                    formatter,
+                    "failed to configure Alternator routing: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AlternatorClientBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            AlternatorClientBuildErrorKind::MissingBehaviorVersion => None,
+            AlternatorClientBuildErrorKind::LiveNodes(source) => Some(source),
+        }
+    }
+}
+
+impl From<LiveNodesBuildError> for AlternatorClientBuildError {
+    fn from(source: LiveNodesBuildError) -> Self {
+        Self {
+            kind: AlternatorClientBuildErrorKind::LiveNodes(source),
+        }
+    }
+}
+
 impl AlternatorClient {
+    /// Constructs a client, panicking if its routing configuration is invalid.
+    ///
+    /// Use [`Self::try_from_conf`] when configuration comes from a fallible or
+    /// externally supplied source.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no AWS SDK behavior version is set, when neither a usable
+    /// discovery seed nor an explicit direct endpoint is configured, or when
+    /// discovery resources cannot be built.
     pub fn from_conf(config: AlternatorConfig) -> Self {
+        Self::try_from_conf(config)
+            .unwrap_or_else(|error| panic!("failed to construct AlternatorClient: {error}"))
+    }
+
+    /// Tries to construct a client after validating required SDK and routing
+    /// configuration.
+    pub fn try_from_conf(config: AlternatorConfig) -> Result<Self, AlternatorClientBuildError> {
+        if !config.has_behavior_version() {
+            return Err(AlternatorClientBuildError {
+                kind: AlternatorClientBuildErrorKind::MissingBehaviorVersion,
+            });
+        }
+
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
 
@@ -80,8 +151,11 @@ impl AlternatorClient {
         // If live nodes are not in config - create new config with live nodes.
         let (config, live_nodes) = if let Some(nodes) = config.live_nodes() {
             (config, Some(nodes))
-        } else if let Some(nodes) = LiveNodes::new(&config) {
-            let config = config.to_builder().live_nodes(nodes.clone()).build();
+        } else if let Some(nodes) = LiveNodes::try_new(&config)? {
+            let config = config
+                .to_builder()
+                .auto_created_live_nodes(nodes.clone())
+                .build();
             (config, Some(nodes))
         } else {
             (config, None)
@@ -136,10 +210,10 @@ impl AlternatorClient {
             nodes.ensure_discovery_started();
         }
 
-        Self {
+        Ok(Self {
             dynamodb_client,
             config,
-        }
+        })
     }
 
     pub fn from_conf_with_live_nodes(
@@ -540,6 +614,7 @@ mod tests {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
                 .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -562,6 +637,7 @@ mod tests {
             AlternatorConfig::builder()
                 .optimize_headers(true)
                 .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -574,5 +650,52 @@ mod tests {
                 .expect("does not have length"),
             0
         )
+    }
+
+    #[test]
+    fn try_from_conf_rejects_missing_or_invalid_configuration() {
+        let missing_behavior = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .endpoint_url("http://127.0.0.1:8000")
+                .build(),
+        )
+        .unwrap_err();
+        assert!(
+            missing_behavior
+                .to_string()
+                .contains("behavior version must be set")
+        );
+
+        let missing = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .build(),
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("no Alternator routing target"));
+
+        let invalid = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme("http")
+                .seed_hosts(["127.0.0.1:invalid"])
+                .build(),
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("invalid seed host"));
+
+        let invalid_direct = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url("not a URL")
+                .seed_hosts(Vec::<String>::new())
+                .build(),
+        )
+        .unwrap_err();
+        assert!(
+            invalid_direct
+                .to_string()
+                .contains("no Alternator routing target")
+        );
     }
 }
