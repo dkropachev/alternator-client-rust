@@ -43,7 +43,7 @@ Add the crate to your `Cargo.toml`:
 ```toml
 [dependencies]
 alternator-driver = { git = "https://github.com/scylladb/alternator-client-rust" }
-aws-sdk-dynamodb = { version = "=1.118.0", default-features = false }
+aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
 ```
 > **Note**: This crate is not yet published to crates.io. Depend on it via the GitHub URL.

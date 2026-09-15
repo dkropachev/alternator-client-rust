@@ -861,6 +861,10 @@ impl AlternatorConfig {
         self.dynamodb_config.framework_metadata()
     }
 
+    pub fn disable_clock_skew_correction(&self) -> Option<bool> {
+        self.dynamodb_config.disable_clock_skew_correction()
+    }
+
     pub fn invocation_id_generator(
         &self,
     ) -> Option<aws_runtime::invocation_id::SharedInvocationIdGenerator> {
@@ -877,6 +881,22 @@ impl AlternatorConfig {
 }
 
 impl AlternatorBuilder {
+    pub fn emit_input_attributes(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.dynamodb_builder = self.dynamodb_builder.emit_input_attributes(names);
+        self
+    }
+
+    pub fn capture_input_attributes(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.dynamodb_builder = self.dynamodb_builder.capture_input_attributes(names);
+        self
+    }
+
     pub fn stalled_stream_protection(
         mut self,
         stalled_stream_protection_config: aws_sdk_dynamodb::config::StalledStreamProtectionConfig,
@@ -1137,6 +1157,25 @@ impl AlternatorBuilder {
     ) -> &mut Self {
         self.dynamodb_builder
             .push_framework_metadata(framework_metadata);
+        self
+    }
+
+    pub fn disable_clock_skew_correction(
+        mut self,
+        disable_clock_skew_correction: impl Into<Option<bool>>,
+    ) -> Self {
+        self.dynamodb_builder = self
+            .dynamodb_builder
+            .disable_clock_skew_correction(disable_clock_skew_correction);
+        self
+    }
+
+    pub fn set_disable_clock_skew_correction(
+        &mut self,
+        disable_clock_skew_correction: Option<bool>,
+    ) -> &mut Self {
+        self.dynamodb_builder
+            .set_disable_clock_skew_correction(disable_clock_skew_correction);
         self
     }
 
