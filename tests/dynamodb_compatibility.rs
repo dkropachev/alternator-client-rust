@@ -170,6 +170,7 @@ fn test_client() {
 
     let mut with_exceptions = dynamodb_client_methods;
     with_exceptions.remove(&(None, "new".into())); // use AlternatorClient::from_conf with explicit AlternatorConfig
+    with_exceptions.remove(&(None, "search_vectors".into())); // Alternator does not support the AWS SearchVectors operation
 
     let unimplemented = with_exceptions.difference(&alternator_client_methods);
     let all_implemented = unimplemented.clone().next().is_none();
