@@ -33,20 +33,28 @@ On Scylla Cloud in regular setup it represents cloud provider availability zone 
 ## Introduction
 
 This crate is a thin wrapper for the AWS Rust SDK that builds DynamoDB clients which load-balance across Alternator nodes.
-Includes optimizations for Lightweight Transactions (LWTs), request compression, and header stripping.
+It adds client-side discovery and load balancing, routing-scope controls, optional key-route affinity for LWT-heavy workloads, request/response compression, header stripping, and no-auth defaults for Alternator deployments.
 
 ## Using the crate
-
 
 Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-alternator-driver = { git = "https://github.com/scylladb/alternator-client-rust" }
-aws-sdk-dynamodb = { version = "=1.124.0", default-features = false }
+alternator-driver = "0.1"
+aws-sdk-dynamodb = { version = "1.124", default-features = false }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "sync", "time"] }
 ```
-> **Note**: This crate is not yet published to crates.io. Depend on it via the GitHub URL.
+
+For unreleased development versions, depend on the GitHub repository instead:
+
+```toml
+alternator-driver = { git = "https://github.com/scylladb/alternator-client-rust" }
+```
+
+The direct `aws-sdk-dynamodb` dependency should use a version requirement compatible with the version selected by the driver. Cargo will normally resolve one compatible `aws-sdk-dynamodb` 1.x and one compatible Tokio 1.x version for both your application and this crate.
+
+This crate uses Rust 2024 edition and requires Rust 1.94.1 or newer. Your application can use a different Rust edition, but the toolchain must be new enough to compile this crate.
 
 Keep the direct `aws-sdk-dynamodb` version aligned with the driver and disable
 its default features. The driver enables the current AWS SDK HTTPS client;
@@ -81,7 +89,9 @@ async fn main() {
 }
 ```
 
-When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK. Alternator supports no-auth and SigV4 signing through configured or per-request credentials; custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are not exposed. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
+When no credentials provider is configured, `AlternatorClient` enables no-auth automatically. Clients with a credentials provider continue to sign requests through the AWS SDK.
+
+Alternator supports no-auth and SigV4 signing through configured or per-request credentials. Custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are not exposed. Use `allow_no_auth()` when you want to make unsigned access explicit. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
 
 This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
@@ -89,16 +99,16 @@ This client targets ScyllaDB Alternator. It does not guarantee that Alternator-s
 
 Build clients with `AlternatorConfig::builder()` and set Alternator behavior explicitly. The driver intentionally does not import shared `aws_types::SdkConfig` values, because shared SDK config can contain AWS-specific auth and endpoint settings that do not map cleanly to Alternator.
 
-There is no `AlternatorClient::new(&SdkConfig)`, `AlternatorConfig::new(&SdkConfig)`, or `AlternatorConfig::from(&SdkConfig)` shortcut. Start from `AlternatorConfig::builder()` and copy only the supported SDK settings your client needs, such as `region(...)`, `credentials_provider(...)`, `retry_config(...)`, `timeout_config(...)`, `http_client(...)`, `app_name(...)`, or `interceptor(...)`.
+There is no `AlternatorClient::new(&SdkConfig)`, `AlternatorConfig::new(&SdkConfig)`, or `AlternatorConfig::from(&SdkConfig)` shortcut. Start from `AlternatorConfig::builder()` and copy only the supported SDK settings your client needs, such as `region(...)`, `credentials_provider(...)`, `retry_config(...)`, `timeout_config(...)`, `http_client(...)`, `app_name(...)`, `framework_metadata(...)`, or `interceptor(...)`.
 
 Supported auth modes are:
 - no-auth, enabled automatically when no credentials provider is configured, or explicitly with `allow_no_auth()`
 - SigV4 with a credentials provider configured through `credentials_provider(...)`
 - SigV4 with per-request credentials, usually with a client built using `require_auth()`
 
-The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, or custom endpoint resolvers. These APIs are intentionally absent rather than accepted and ignored. Use `endpoint_url(...)` or the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing.
+The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, or custom endpoint resolvers. These APIs are intentionally absent rather than accepted and ignored. Use `endpoint_url(...)` or the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing. Use `user_agent(...)` for Alternator client identification.
 
-Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, and interceptors remain available as escape hatches. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
+Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, framework metadata, and interceptors remain available as escape hatches. Framework metadata is passed through to the underlying DynamoDB config for SDK integrations, while `user_agent(...)` controls the driver's final Alternator client identification. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
 
 Operation builders are DynamoDB SDK passthroughs for source compatibility, but Alternator support is server-dependent. AWS-only surfaces such as backup/PITR/export/import, global tables, Kinesis streaming destinations, contributor insights, resource policies, tagging, `describe_endpoints`, `describe_limits`, PartiQL, and replica auto-scaling may fail against Alternator unless the server explicitly supports them.
 
@@ -156,8 +166,8 @@ misleading for your deployment, set an explicit region on the
 `AlternatorConfig` builder:
 
 ```rust
-use aws_sdk_dynamodb::config::Region;
 use alternator_driver::AlternatorConfig;
+use aws_sdk_dynamodb::config::Region;
 
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
@@ -178,9 +188,15 @@ The client maintains a list of live nodes, which it refreshes in the background.
 Both intervals are configurable:
 
 ```rust
+use alternator_driver::AlternatorConfig;
+use std::time::Duration;
 
-.active_interval(std::time::Duration::from_millis(500))
-.idle_interval(std::time::Duration::from_secs(30))
+let config = AlternatorConfig::builder()
+    .endpoint_url("http://10.0.0.1:8043")
+    .active_interval(Duration::from_millis(500))
+    .idle_interval(Duration::from_secs(30))
+    .behavior_version_latest()
+    .build();
 ```
 
 The refresh task runs in the background for the lifetime of the client. It terminates automatically when the client is dropped.
@@ -404,8 +420,15 @@ let client = AlternatorClient::from_conf(
 Alternator accepts compressed requests to reduce bandwidth for write-heavy workloads (such as BatchWriteItem and large PutItem payloads).
 
 You can enable compression in `AlternatorConfig`, like so:
+
 ```rust
-use alternator_driver::{AlternatorConfig, AlternatorClient, RequestCompression, CompressionAlgorithm, CompressionLevel};
+use alternator_driver::{
+    AlternatorClient,
+    AlternatorConfig,
+    CompressionAlgorithm,
+    CompressionLevel,
+    RequestCompression,
+};
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
@@ -428,7 +451,12 @@ Currently, the driver supports two algorithms: Gzip and Deflate. For either one,
 The driver transparently decompresses gzip and deflate responses based on the `Content-Encoding` header. To request compressed responses, configure response compression in `AlternatorConfig`:
 
 ```rust
-use alternator_driver::{AlternatorConfig, AlternatorClient, ResponseCompression, ResponseCompressionAlgorithm};
+use alternator_driver::{
+    AlternatorClient,
+    AlternatorConfig,
+    ResponseCompression,
+    ResponseCompressionAlgorithm,
+};
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
@@ -448,10 +476,10 @@ The default is `disabled()`; use `enabled()`, `enabled_many()`, or `enabled_all(
 
 ## Per-operation override
 
-In case an Alternator-specific setting is to be overridden for a specified driver call, you can use the same `.customize()` pattern that DynamoDB uses.
+To override an Alternator-specific setting for one request, use the same `.customize()` pattern that DynamoDB uses.
 
 ```rust
-use alternator_driver::*; // Include AlternatorCustomizableOperation - trait responsible for customization
+use alternator_driver::*; // Includes AlternatorCustomizableOperation.
 use aws_sdk_dynamodb::types::*;
 // ...
 client
@@ -461,7 +489,7 @@ client
     .item("ExampleAttribute", AttributeValue::S("ExampleItem".into()))
 
     .customize()
-    .alternator_config_override(    // <-- Instead of config_override
+    .alternator_config_override(
         AlternatorConfig::operation_builder()
             .request_compression(RequestCompression::disabled())
     )
@@ -473,3 +501,37 @@ client
 `alternator_config_override` currently applies only Alternator-specific compression settings: request compression and response compression. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
 > **Note**: load-balancing, endpoint, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression settings.
+
+## Development
+
+Run local static checks with:
+
+```sh
+make lint
+```
+
+Run unit tests that do not require ScyllaDB with:
+
+```sh
+make test-unit
+```
+
+Run the integration tests against a CCM-managed ScyllaDB node with:
+
+```sh
+make test-integration
+```
+
+Run the complete regular, topology, and load-balancing test suite with:
+
+```sh
+make test-all
+```
+
+The integration and complete test targets require `scylla-ccm` to be installed and available on `PATH`. They create a temporary `alternator-client-rust` CCM cluster and remove it when the tests finish. Use `make scylla-rm` to remove that cluster manually if a run is interrupted.
+
+Before publishing a release, run:
+
+```sh
+cargo publish --dry-run
+```
