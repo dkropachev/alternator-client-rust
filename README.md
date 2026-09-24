@@ -185,6 +185,25 @@ Both intervals are configurable:
 
 The refresh task runs in the background for the lifetime of the client. It terminates automatically when the client is dropped.
 
+If several clients should share the same discovery state, construct a `LiveNodes` instance once and pass it to each client:
+
+```rust
+use alternator_driver::{AlternatorClient, AlternatorConfig, LiveNodes};
+
+let discovery_config = AlternatorConfig::builder()
+    .endpoint_url("http://10.0.0.1:8043")
+    .behavior_version_latest()
+    .build();
+
+let live_nodes = LiveNodes::new(&discovery_config).expect("discovery is enabled");
+
+let client_a =
+    AlternatorClient::from_conf_with_live_nodes(discovery_config.clone(), live_nodes.clone());
+let client_b = AlternatorClient::from_conf_with_live_nodes(discovery_config, live_nodes);
+```
+
+The shared `LiveNodes` keeps its own discovery settings. Client configs that reuse it do not change its routing scope, seed hosts, scheme, port, active interval, or idle interval.
+
 ### Routing scope
 
 By default, the client uses every live Alternator node it discovers across the cluster. For deployments spanning multiple datacenters or racks, you usually want requests to stay within a specific datacenter — or within a specific rack of a specific datacenter — to minimize cross-zone latency and bandwidth.

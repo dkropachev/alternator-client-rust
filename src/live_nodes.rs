@@ -243,6 +243,23 @@ fn build_discovery_http_client(
     Ok((client, native_roots_usable))
 }
 
+/// Shared state for Alternator node discovery and client-side routing.
+///
+/// Most clients should let [`AlternatorClient::from_conf`] construct this
+/// automatically. Construct and share a [`LiveNodes`] instance explicitly only
+/// when multiple clients should reuse one background discovery task.
+///
+/// ```
+/// use alternator_driver::{AlternatorConfig, LiveNodes};
+///
+/// let config = AlternatorConfig::builder()
+///     .endpoint_url("http://127.0.0.1:8000")
+///     .behavior_version_latest()
+///     .build();
+/// let live_nodes = LiveNodes::new(&config).expect("discovery is enabled");
+/// ```
+///
+/// [`AlternatorClient::from_conf`]: crate::client::AlternatorClient::from_conf
 #[derive(Debug)]
 pub struct LiveNodes {
     routing_scope: RoutingScope,
