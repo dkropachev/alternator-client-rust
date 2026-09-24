@@ -45,7 +45,6 @@ use aws_smithy_types::config_bag::ConfigBag;
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
-///    .behavior_version_latest()
 ///    .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
@@ -324,10 +323,12 @@ fn try_dynamodb_client_from_conf(
     }
 }
 
-fn sdk_http_client(
-    behavior_version: aws_sdk_dynamodb::config::BehaviorVersion,
-    use_tls: bool,
-) -> aws_sdk_dynamodb::config::SharedHttpClient {
+/// Builds the modern connector selected by the pinned behavior version.
+///
+/// Supplying it explicitly lets the fallible constructor capture SDK config
+/// validation failures. TLS is omitted for plaintext endpoints on hosts with
+/// no usable native root store.
+fn sdk_http_client(use_tls: bool) -> aws_sdk_dynamodb::config::SharedHttpClient {
     aws_smithy_http_client::Builder::new().build_with_connector_fn(
         move |settings, runtime_components| {
             let mut connector = aws_smithy_http_client::ConnectorBuilder::default();
@@ -336,15 +337,8 @@ fn sdk_http_client(
                 connector.set_sleep_impl(components.sleep_impl());
             }
 
-            #[allow(deprecated)]
-            let proxy_config = if behavior_version
-                .is_at_least(aws_sdk_dynamodb::config::BehaviorVersion::v2025_08_07())
-            {
-                aws_smithy_http_client::proxy::ProxyConfig::from_env()
-            } else {
-                aws_smithy_http_client::proxy::ProxyConfig::disabled()
-            };
-            connector.set_proxy_config(Some(proxy_config));
+            connector
+                .set_proxy_config(Some(aws_smithy_http_client::proxy::ProxyConfig::from_env()));
 
             if use_tls {
                 connector
@@ -377,13 +371,6 @@ impl AlternatorClient {
     /// Tries to construct a client after validating required SDK and routing
     /// configuration.
     pub fn try_from_conf(config: AlternatorConfig) -> Result<Self, AlternatorClientBuildError> {
-        // Default this client internally without enabling the SDK's
-        // dependency-wide behavior-version-latest feature. That feature would
-        // also change direct SDK clients in downstream applications.
-        let behavior_version = config
-            .behavior_version()
-            .unwrap_or_else(aws_sdk_dynamodb::config::BehaviorVersion::latest);
-
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
         let stalled_stream_protection_explicitly_unset =
@@ -399,7 +386,6 @@ impl AlternatorClient {
         let has_region = dynamodb_config.region().is_some();
 
         let mut builder = dynamodb_config.to_builder();
-        builder.set_behavior_version(Some(behavior_version));
 
         if !has_credentials_provider && !config.requires_auth() && !config.allows_no_auth() {
             builder = builder.allow_no_auth();
@@ -446,14 +432,10 @@ impl AlternatorClient {
                     .map(|nodes| nodes.has_usable_native_roots())
                     .unwrap_or_else(native_roots_are_usable);
 
-            // Select the SDK's modern connector explicitly for every behavior
-            // version. Besides supplying it for pre-2026 versions, this gives
-            // the fallible constructor a component through which it can run
-            // the SDK's complete validation without relying on a panic.
-            builder.set_http_client(Some(sdk_http_client(
-                behavior_version,
-                !needs_rootless_plaintext_transport,
-            )));
+            // Supplying the pinned behavior's connector explicitly gives the
+            // fallible constructor a component through which it can run the
+            // SDK's complete validation without relying on a panic.
+            builder.set_http_client(Some(sdk_http_client(!needs_rootless_plaintext_transport)));
         }
 
         if !has_region {
@@ -1099,7 +1081,6 @@ mod tests {
     fn test_client_adds_hooks_to_inner_client() {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
-                .behavior_version_latest()
                 .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
@@ -1122,7 +1103,6 @@ mod tests {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
                 .optimize_headers(true)
-                .behavior_version_latest()
                 .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
@@ -1138,8 +1118,11 @@ mod tests {
         )
     }
 
+    /// The driver pins the SDK behavior major version itself, so a config that
+    /// never mentions one still builds instead of hitting the SDK's "a behavior
+    /// major version must be set" panic.
     #[test]
-    fn try_from_conf_sets_its_behavior_version_default_internally() {
+    fn try_from_conf_pins_the_behavior_version_itself() {
         let client = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
                 .endpoint_url("http://127.0.0.1:8000")
@@ -1163,7 +1146,6 @@ mod tests {
             Some(crate::keyrouting::KeyRouteAffinityType::AnyWrite),
         ] {
             let mut builder = AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme("http")
                 .port(8000)
                 .seed_hosts(["127.0.0.1"])
@@ -1184,7 +1166,6 @@ mod tests {
     fn try_from_conf_returns_identity_cache_validation_errors() {
         let error = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .behavior_version_latest()
                 .endpoint_url("http://127.0.0.1:8000")
                 .identity_cache(InvalidIdentityCache)
                 .build(),
@@ -1209,7 +1190,6 @@ mod tests {
 
             let base_builder = || {
                 AlternatorConfig::builder()
-                    .behavior_version_latest()
                     .endpoint_url("http://127.0.0.1:8000")
                     .seed_hosts(Vec::<String>::new())
             };
@@ -1226,7 +1206,6 @@ mod tests {
 
             let error = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .behavior_version_latest()
                     .endpoint_url("http://127.0.0.1:8000")
                     .http_client(InvalidHttpClient)
                     .build(),
@@ -1240,7 +1219,6 @@ mod tests {
             let validation_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let client = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .behavior_version_latest()
                     .endpoint_url("http://127.0.0.1:8000")
                     .seed_hosts(Vec::<String>::new())
                     .http_client(SingleValidationHttpClient(validation_count.clone()))
@@ -1286,7 +1264,6 @@ mod tests {
     async fn validation_adapters_preserve_per_operation_component_overrides() {
         let client = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .behavior_version_latest()
                 .endpoint_url("http://127.0.0.1:8000")
                 .seed_hosts(Vec::<String>::new())
                 .identity_cache(FinalValidationIdentityCache("base identity cache used"))
@@ -1329,17 +1306,12 @@ mod tests {
 
     #[test]
     fn try_from_conf_rejects_missing_or_invalid_routing_configuration() {
-        let missing = AlternatorClient::try_from_conf(
-            AlternatorConfig::builder()
-                .behavior_version_latest()
-                .build(),
-        )
-        .unwrap_err();
+        let missing =
+            AlternatorClient::try_from_conf(AlternatorConfig::builder().build()).unwrap_err();
         assert!(missing.to_string().contains("no Alternator routing target"));
 
         let invalid = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme("http")
                 .seed_hosts(["127.0.0.1:invalid"])
                 .build(),
@@ -1349,7 +1321,6 @@ mod tests {
 
         let invalid_scheme = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme("https://dynamodb.us-east-1.amazonaws.com/x")
                 .seed_hosts(["127.0.0.1"])
                 .build(),
@@ -1363,7 +1334,6 @@ mod tests {
 
         let invalid_direct = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .behavior_version_latest()
                 .endpoint_url("not a URL")
                 .seed_hosts(Vec::<String>::new())
                 .build(),
@@ -1378,7 +1348,6 @@ mod tests {
         for endpoint in ["ftp://host", "ws://host"] {
             let unsupported_direct = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .behavior_version_latest()
                     .endpoint_url(endpoint)
                     .seed_hosts(Vec::<String>::new())
                     .build(),

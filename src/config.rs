@@ -30,7 +30,6 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) has_credentials_provider: bool,
     pub(crate) require_auth: bool,
     pub(crate) allow_no_auth: bool,
-    pub(crate) behavior_version: Option<aws_sdk_dynamodb::config::BehaviorVersion>,
     pub(crate) active_interval: Option<std::time::Duration>,
     pub(crate) idle_interval: Option<std::time::Duration>,
     pub(crate) routing_scope: Option<RoutingScope>,
@@ -41,6 +40,18 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
     pub(crate) stalled_stream_protection_explicitly_unset: bool,
 }
+
+/// The AWS SDK behavior major version every client is built on.
+///
+/// The SDK groups its defaults - retries, timeouts, transport, proxy handling -
+/// into dated behavior major versions, and asks applications to pick the one
+/// they validated against so an SDK upgrade never changes those defaults
+/// silently. Alternator's API is fixed and has nothing to do with those
+/// bundles, so this driver makes the choice once, for the version it is tested
+/// against, rather than passing it on to callers. Retry, timeout and HTTP
+/// client settings stay individually configurable on the builder.
+pub(crate) const ALTERNATOR_BEHAVIOR_VERSION: fn() -> aws_sdk_dynamodb::config::BehaviorVersion =
+    aws_sdk_dynamodb::config::BehaviorVersion::v2026_01_12;
 
 const INCOMPATIBLE_AUTH_OPTIONS_MESSAGE: &str = "require_auth() cannot be combined with allow_no_auth(): require_auth() makes missing credentials fail before sending an unsigned request, while allow_no_auth() explicitly permits unsigned requests.";
 
@@ -70,7 +81,6 @@ fn incompatible_auth_options() -> ! {
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
-///     .behavior_version_latest()
 ///     .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
@@ -235,10 +245,6 @@ impl AlternatorConfig {
         self.alternator_ext.endpoint_url.as_deref()
     }
 
-    pub(crate) fn behavior_version(&self) -> Option<aws_sdk_dynamodb::config::BehaviorVersion> {
-        self.alternator_ext.behavior_version
-    }
-
     /// Gets the key route affinity configuration.
     ///
     /// For more information see [keyrouting::affinity_config::KeyRouteAffinityConfig] and [keyrouting::affinity_config::KeyRouteAffinityType].
@@ -267,7 +273,6 @@ impl AlternatorConfig {
 ///
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder()
-///         .behavior_version_latest()
 ///         .endpoint_url("http://127.0.0.1:8000")
 ///         .build(),
 /// );
@@ -341,7 +346,6 @@ impl AlternatorOperationBuilder {
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
-///    .behavior_version_latest()
 ///    .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
@@ -358,7 +362,10 @@ impl AlternatorBuilder {
         Self::default()
     }
 
-    pub fn build(self) -> AlternatorConfig {
+    pub fn build(mut self) -> AlternatorConfig {
+        self.dynamodb_builder
+            .set_behavior_version(Some(ALTERNATOR_BEHAVIOR_VERSION()));
+
         AlternatorConfig {
             dynamodb_config: self.dynamodb_builder.build(),
             alternator_ext: self.alternator_ext,
@@ -1128,30 +1135,6 @@ impl AlternatorBuilder {
             .set_credentials_provider(credentials_provider);
         self
     }
-
-    pub fn behavior_version(
-        mut self,
-        behavior_version: aws_sdk_dynamodb::config::BehaviorVersion,
-    ) -> Self {
-        self.set_behavior_version(Some(behavior_version));
-        self
-    }
-
-    pub fn set_behavior_version(
-        &mut self,
-        behavior_version: Option<aws_sdk_dynamodb::config::BehaviorVersion>,
-    ) -> &mut Self {
-        self.alternator_ext.behavior_version = behavior_version;
-        self.dynamodb_builder.set_behavior_version(behavior_version);
-        self
-    }
-
-    pub fn behavior_version_latest(mut self) -> Self {
-        self.alternator_ext.behavior_version =
-            Some(aws_sdk_dynamodb::config::BehaviorVersion::latest());
-        self.dynamodb_builder = self.dynamodb_builder.behavior_version_latest();
-        self
-    }
 }
 
 #[cfg(test)]
@@ -1170,7 +1153,6 @@ mod test {
                 0,
             ))
             .user_agent("custom-client/1.2.3")
-            .behavior_version_latest()
             .build();
 
         assert!(config.optimize_headers().is_none());
@@ -1212,10 +1194,7 @@ mod test {
 
     #[test]
     fn config_does_not_add_hooks() {
-        let config = AlternatorConfig::builder()
-            .optimize_headers(true)
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().optimize_headers(true).build();
 
         assert!(
             config
@@ -1246,7 +1225,6 @@ mod test {
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
-            .behavior_version_latest()
             .build();
 
         assert!(config.has_credentials_provider());
@@ -1254,10 +1232,7 @@ mod test {
 
     #[test]
     fn require_auth_requires_credentials() {
-        let config = AlternatorConfig::builder()
-            .require_auth()
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().require_auth().build();
 
         assert!(config.requires_auth());
     }
@@ -1267,17 +1242,14 @@ mod test {
         let mut builder = AlternatorConfig::builder().require_auth();
 
         builder.set_require_auth(false);
-        let config = builder.behavior_version_latest().build();
+        let config = builder.build();
 
         assert!(!config.requires_auth());
     }
 
     #[test]
     fn allow_no_auth_is_remembered() {
-        let config = AlternatorConfig::builder()
-            .allow_no_auth()
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().allow_no_auth().build();
 
         assert!(config.allows_no_auth());
     }
@@ -1297,7 +1269,6 @@ mod test {
     #[test]
     fn from_conf_does_not_panic_without_runtime() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:8000")
             .build();
         let _ = AlternatorClient::from_conf(config);
@@ -1307,7 +1278,6 @@ mod test {
     fn endpoint_url_sets_and_clears_correctly() {
         let config = AlternatorConfig::builder()
             .endpoint_url("http://127.0.0.1:8000")
-            .behavior_version_latest()
             .build();
         assert_eq!(config.seed_hosts(), Some(vec!["127.0.0.1".to_string()]));
         assert_eq!(config.scheme(), Some("http".to_string()));
@@ -1326,24 +1296,15 @@ mod test {
 
     #[test]
     fn setting_scheme_test() {
-        let config = AlternatorConfig::builder()
-            .scheme("https://")
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().scheme("https://").build();
 
         assert_eq!(config.scheme(), Some("https".to_string()));
 
-        let config = AlternatorConfig::builder()
-            .scheme("http:")
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().scheme("http:").build();
 
         assert_eq!(config.scheme(), Some("http".to_string()));
 
-        let config = AlternatorConfig::builder()
-            .scheme("http")
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().scheme("http").build();
 
         assert_eq!(config.scheme(), Some("http".to_string()));
     }
@@ -1354,7 +1315,6 @@ mod test {
             .response_compression(ResponseCompression::enabled(
                 ResponseCompressionAlgorithm::Gzip,
             ))
-            .behavior_version_latest()
             .build();
 
         assert_eq!(
@@ -1379,7 +1339,6 @@ mod test {
     fn config_response_compression_disabled_roundtrip() {
         let config = AlternatorConfig::builder()
             .response_compression(ResponseCompression::disabled())
-            .behavior_version_latest()
             .build();
 
         assert_eq!(
@@ -1401,9 +1360,7 @@ mod test {
 
     #[test]
     fn config_response_compression_unset_is_none() {
-        let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().build();
 
         assert!(config.response_compression().is_none());
     }
