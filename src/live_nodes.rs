@@ -579,6 +579,13 @@ impl LiveNodes {
             return None;
         }
 
+        // Checking an exhausted query plan must not advance the shared
+        // round-robin position. The caller may clear `used_nodes` and retry,
+        // and that retry should consume the next position itself.
+        if live_nodes.iter().all(|node| used_nodes.contains(node)) {
+            return None;
+        }
+
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
         for i in 0..len {
             let idx = (start + i) % len;

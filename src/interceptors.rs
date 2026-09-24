@@ -154,9 +154,12 @@ impl Intercept for AlternatorInterceptor {
     ) -> Result<(), BoxError> {
         // Take the next node from the query plan and override the request URI.
         if let Some(query_plan) = cfg.interceptor_state().load::<QueryPlan>() {
-            let next_node = query_plan.next_node().ok_or(
-                "query plan exhausted before the request could be routed to an Alternator node",
-            )?;
+            // Retrying more times than there are nodes exhausts one pass over
+            // the plan. Restart it so every attempt remains routed to a live
+            // Alternator node.
+            let next_node = query_plan
+                .next_node_or_restart()
+                .ok_or("no live Alternator node available to route the request to")?;
             let request = context.request_mut();
             let mut current = url::Url::parse(request.uri())?;
             current
@@ -610,10 +613,11 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_query_plan_rejects_unrouted_sdk_endpoint() {
+    fn exhausted_query_plan_restarts_before_routing() {
         const SDK_ENDPOINT: &str = "https://dynamodb.us-east-1.amazonaws.com/";
 
-        let query_plan = QueryPlan::new_basic(make_live_nodes());
+        let live_nodes = make_live_nodes();
+        let query_plan = QueryPlan::new_basic(live_nodes.clone());
         while query_plan.next_node().is_some() {}
 
         let mut cfg = ConfigBag::base();
@@ -634,12 +638,20 @@ mod tests {
             false,
         );
 
-        let error = interceptor
+        interceptor
             .modify_before_signing(&mut context, &runtime_components, &mut cfg)
-            .expect_err("an exhausted query plan must fail closed");
+            .expect("an exhausted plan should restart");
 
-        assert!(error.to_string().contains("query plan exhausted"));
-        assert_eq!(context.request().uri(), SDK_ENDPOINT);
+        let routed = url::Url::parse(context.request().uri()).expect("routed URI");
+        assert_ne!(context.request().uri(), SDK_ENDPOINT);
+        assert!(
+            live_nodes.get_live_nodes().iter().any(|node| {
+                node.scheme() == routed.scheme()
+                    && node.host_str() == routed.host_str()
+                    && node.port() == routed.port()
+            }),
+            "request must be routed to a live Alternator node, got {routed}"
+        );
     }
 
     fn preferred_node_for_key(live_nodes: &Arc<LiveNodes>, key: &str) -> String {
