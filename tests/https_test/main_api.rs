@@ -29,8 +29,10 @@ async fn test_https_main_api(ctx: &mut HttpsTestContext) {
     // Discovery is disabled here so the request path only exercises the main API.
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("https://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .scheme("https")
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(BehaviorVersion::latest())
             .credentials_provider(Credentials::for_tests_with_session_token())
             .build(),

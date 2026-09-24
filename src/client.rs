@@ -33,8 +33,9 @@ use crate::*;
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
-///    .behavior_version_latest()
-///    .endpoint_url("http://127.0.0.1:8000")
+///     .seed_hosts(["127.0.0.1"])
+///     .port(8000)
+///     .behavior_version_latest()
 ///     // ...
 ///     .build();
 ///
@@ -198,19 +199,20 @@ impl AlternatorClient {
             (config, None)
         };
 
+        // With discovery off nothing rewrites the request, so the transport
+        // is decided by the scheme configured for the seed host itself.
+        let direct_scheme = live_nodes
+            .is_none()
+            .then(|| config.scheme().unwrap_or_else(|| "http".to_string()));
         let uses_plaintext_transport = live_nodes
             .as_ref()
             .is_some_and(|nodes| nodes.scheme() == "http")
-            || live_nodes.is_none()
-                && config
-                    .endpoint_url()
-                    .and_then(|endpoint| url::Url::parse(endpoint).ok())
-                    .is_some_and(|endpoint| endpoint.scheme() == "http");
-        let uses_direct_https_transport = live_nodes.is_none()
-            && config
-                .endpoint_url()
-                .and_then(|endpoint| url::Url::parse(endpoint).ok())
-                .is_some_and(|endpoint| endpoint.scheme() == "https");
+            || direct_scheme
+                .as_deref()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
+        let uses_direct_https_transport = direct_scheme
+            .as_deref()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
         let has_custom_http_client = dynamodb_config.http_client().is_some();
 
         if uses_direct_https_transport && !has_custom_http_client {
@@ -297,6 +299,11 @@ impl AlternatorClient {
         })
     }
 
+    /// Constructs a client with explicitly shared discovery state.
+    ///
+    /// Explicit live nodes take precedence over direct routing selected with
+    /// [`AlternatorBuilder::without_discovery`]; supplying them re-enables
+    /// discovery and client-side routing.
     pub fn from_conf_with_live_nodes(
         config: AlternatorConfig,
         live_nodes: std::sync::Arc<LiveNodes>,
@@ -694,8 +701,9 @@ mod tests {
     fn test_client_adds_hooks_to_inner_client() {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
                 .behavior_version_latest()
-                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -717,8 +725,9 @@ mod tests {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
                 .optimize_headers(true)
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
                 .behavior_version_latest()
-                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -737,8 +746,9 @@ mod tests {
     fn try_from_conf_honors_sdk_behavior_version_default() {
         let client = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .endpoint_url("http://127.0.0.1:8000")
-                .seed_hosts(Vec::<String>::new())
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .without_discovery()
                 .build(),
         );
 
@@ -781,9 +791,8 @@ mod tests {
 
         let invalid_direct = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
+                .without_discovery()
                 .behavior_version_latest()
-                .endpoint_url("not a URL")
-                .seed_hosts(Vec::<String>::new())
                 .build(),
         )
         .unwrap_err();
@@ -793,12 +802,13 @@ mod tests {
                 .contains("no Alternator routing target")
         );
 
-        for endpoint in ["ftp://host", "ws://host"] {
+        for scheme in ["ftp", "ws"] {
             let unsupported_direct = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
+                    .scheme(scheme)
+                    .seed_hosts(["host"])
+                    .without_discovery()
                     .behavior_version_latest()
-                    .endpoint_url(endpoint)
-                    .seed_hosts(Vec::<String>::new())
                     .build(),
             )
             .unwrap_err();

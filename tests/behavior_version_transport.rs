@@ -137,18 +137,18 @@ async fn pre_2026_behavior_versions_can_send_http_and_https_requests() {
         ("v2025_01_17", BehaviorVersion::v2025_01_17()),
         ("v2025_08_07", BehaviorVersion::v2025_08_07()),
     ];
-    let endpoints = [
-        format!("http://localhost:{http_port}"),
-        format!("https://localhost:{https_port}"),
-    ];
+    let endpoints = [("http", http_port), ("https", https_port)];
     let mut failures = Vec::new();
 
     for (version_name, behavior_version) in behavior_versions {
-        for endpoint in &endpoints {
+        for &(scheme, port) in &endpoints {
+            let endpoint = format!("{scheme}://localhost:{port}");
             let client = match AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .endpoint_url(endpoint)
-                    .seed_hosts(Vec::<String>::new())
+                    .scheme(scheme)
+                    .seed_hosts(["localhost"])
+                    .port(port)
+                    .without_discovery()
                     .behavior_version(behavior_version)
                     .build(),
             ) {

@@ -83,8 +83,12 @@ fn clean_up_cluster() {
     }
 }
 
-pub(crate) fn default_endpoint_url(cluster: &Cluster) -> String {
-    cluster.datacenters()[0].racks()[0].nodes()[0].address()
+pub(crate) fn default_seed_host(cluster: &Cluster) -> String {
+    cluster.datacenters()[0].racks()[0].nodes()[0].ip.clone()
+}
+
+pub(crate) fn default_seed_port(cluster: &Cluster) -> u16 {
+    cluster.datacenters()[0].racks()[0].nodes()[0].alternator_port
 }
 
 // Struct for counting connections accepted / closed and requests made to the proxy.
@@ -326,7 +330,8 @@ pub(crate) fn minimal_builder() -> AlternatorBuilder {
 pub(crate) fn create_client_with_scope(cluster: &Cluster, scope: RoutingScope) -> AlternatorClient {
     AlternatorClient::from_conf(
         minimal_builder()
-            .endpoint_url(default_endpoint_url(cluster))
+            .seed_hosts([default_seed_host(cluster)])
+            .port(default_seed_port(cluster))
             .routing_scope(scope)
             .build(),
     )
@@ -340,7 +345,8 @@ pub(crate) fn create_client_with_scope_and_interval(
 ) -> AlternatorClient {
     AlternatorClient::from_conf(
         minimal_builder()
-            .endpoint_url(default_endpoint_url(cluster))
+            .seed_hosts([default_seed_host(cluster)])
+            .port(default_seed_port(cluster))
             .routing_scope(scope)
             .active_interval(active_interval)
             .build(),

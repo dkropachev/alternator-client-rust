@@ -257,8 +257,9 @@ async fn dynamodb_non_success_responses_keep_connection_reusable() {
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
             .http_client(http_client)
-            .endpoint_url(format!("http://{}", server.address))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([server.address.ip().to_string()])
+            .port(server.address.port())
+            .without_discovery()
             .build(),
     );
 

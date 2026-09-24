@@ -62,7 +62,8 @@ use aws_sdk_dynamodb::types::*;
 async fn main() {
     // Build an AlternatorConfig instead of an aws_sdk_dynamodb::Config.
     let config = AlternatorConfig::builder() // <-- was aws_sdk_dynamodb::Config::builder()
-        .endpoint_url("http://localhost:8000")
+        .seed_hosts(["localhost"])
+        .port(8000)
         .behavior_version_latest()
         .build();
 
@@ -96,7 +97,7 @@ Supported auth modes are:
 - SigV4 with a credentials provider configured through `credentials_provider(...)`
 - SigV4 with per-request credentials, usually with a client built using `require_auth()`
 
-The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, or custom endpoint resolvers. These APIs are intentionally absent rather than accepted and ignored. Use `endpoint_url(...)` or the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing.
+The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, or custom endpoint resolvers. These APIs are intentionally absent rather than accepted and ignored. Neither is the SDK's `endpoint_url(...)`: use the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing, and the SDK endpoint follows from them.
 
 Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, and interceptors remain available as escape hatches. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
 
@@ -106,20 +107,21 @@ Operation builders are DynamoDB SDK passthroughs for source compatibility, but A
 
 A single Alternator cluster typically consists of multiple nodes, any of which can serve any request. This crate distributes requests across the live nodes of the cluster rather than sending everything to one address. There's no separate load-balancer process, routing happens entirely client-side.
 
-### Seed hosts vs endpoint URL
+### Seed hosts
 
-The simplest way to construct a client is with `endpoint_url`, the same field the AWS SDK uses:
+Unlike the AWS SDK, this driver has no `endpoint_url`. Requests go to cluster nodes it discovers for itself, so what it takes is *seed hosts*, together with the Alternator scheme and port. The endpoint the AWS SDK is pointed at follows from them, so there is no second setting to keep in step:
 
 ```rust
 use alternator_driver::AlternatorConfig;
 
 let config = AlternatorConfig::builder()
-    .endpoint_url("http://10.0.0.1:8043")
+    .seed_hosts(["10.0.0.1"])
+    .port(8043)
     .behavior_version_latest()
     .build();
 ```
 
-The host in the URL is treated as a *seed*. For datacenter and rack scopes, the client calls `/localnodes` with the configured scope parameters. For the default cluster-wide scope, the client calls bare `/localnodes` on configured seed hosts and already-known live nodes, then unions the returned node lists. The endpoint URL is never used for actual data-plane traffic after discovery completes.
+For datacenter and rack scopes, the client calls `/localnodes` with the configured scope parameters. For the default cluster-wide scope, the client calls bare `/localnodes` on configured seed hosts and already-known live nodes, then unions the returned node lists. With discovery enabled, data-plane requests are rewritten to discovered live nodes after a routing target is selected.
 
 To give the client multiple candidates for initial discovery, or for deployments where a seed node might be down at startup time, pass multiple seed addresses directly along with the Alternator scheme and port:
 
@@ -140,10 +142,37 @@ let config = AlternatorConfig::builder()
 
 For cluster-wide scope, provide at least one working seed host from every datacenter that should receive traffic. If a datacenter has no working seed in the configuration, the client cannot reliably discover and refresh live Alternator nodes from that datacenter.
 
+To disable client-side discovery and load balancing, for example when sending through a proxy or an external load balancer, give that address as the seed host and turn discovery off:
+
+```rust
+use alternator_driver::AlternatorConfig;
+
+let config = AlternatorConfig::builder()
+    .seed_hosts(["load-balancer.example.com"])
+    .port(8043)
+    .without_discovery()
+    .behavior_version_latest()
+    .build();
+```
+
+In this mode every request goes to that address as it is, with no `/localnodes` discovery and no rewriting. Without a seed host to send them to, building a client fails rather than falling back to an AWS endpoint. Direct routing and explicitly shared live-node state are mutually exclusive; the last setter wins. Calling `without_discovery()` clears configured live nodes, while `live_nodes(...)` or `AlternatorClient::from_conf_with_live_nodes(...)` re-enables discovery.
+
+Because seed hosts are the only routing configuration there is, retargeting an existing client at another cluster is a matter of setting them again:
+
+```rust
+// `client` is an existing AlternatorClient.
+let retargeted = client
+    .config()
+    .to_builder()
+    .seed_hosts(["new-cluster"])
+    .port(8043)
+    .build();
+```
+
 ### AWS SDK region
 
-The AWS Rust SDK keeps a region in the DynamoDB configuration even when
-`endpoint_url` points at Alternator instead of an AWS DynamoDB regional
+The AWS Rust SDK keeps a region in the DynamoDB configuration even when the
+configured seed hosts point at Alternator instead of an AWS DynamoDB regional
 endpoint. Alternator does not use this value for routing; this crate discovers
 live nodes through `/localnodes` and rewrites requests to those nodes. The
 region can still appear in SDK diagnostics, traces, metrics, and signing
@@ -160,7 +189,9 @@ use aws_sdk_dynamodb::config::Region;
 use alternator_driver::AlternatorConfig;
 
 let config = AlternatorConfig::builder()
-    .endpoint_url("http://10.0.0.1:8043")
+    .seed_hosts(["10.0.0.1"])
+    .port(8043)
+    .behavior_version_latest()
     .region(Region::new("eu-central-1"))
     .build();
 ```
@@ -204,7 +235,8 @@ let scope = RoutingScope::from_rack("dc1".to_string(), "rack1".to_string());
 let scope = RoutingScope::from_cluster();
 
 let config = AlternatorConfig::builder()
-    .endpoint_url("http://10.0.0.1:8043")
+    .seed_hosts(["10.0.0.1"])
+    .port(8043)
     .routing_scope(scope)
     .behavior_version_latest()
     .build();
@@ -287,7 +319,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient, KeyRouteAffinityType
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .key_route_affinity(KeyRouteAffinityType::Rmw)
         .behavior_version_latest()
         .build(),
@@ -309,7 +342,8 @@ let affinity = KeyRouteAffinityConfig::builder()
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .key_route_affinity(affinity)
         .behavior_version_latest()
         .build(),
@@ -334,7 +368,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient};
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .user_agent("orders-service/1.0")
         .behavior_version_latest()
         .build(),
@@ -348,7 +383,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient, UserAgent};
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .user_agent(UserAgent::transform(|default| {
             format!("{default} orders-service/1.0")
         }))
@@ -364,7 +400,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient};
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .without_user_agent()
         .behavior_version_latest()
         .build(),
@@ -392,7 +429,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient};
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .optimize_headers(false)
         .behavior_version_latest()
         .build(),
@@ -409,7 +447,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient, RequestCompression, 
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .request_compression(RequestCompression::enabled(
             CompressionAlgorithm::Gzip,
             CompressionLevel::default(),
@@ -432,7 +471,8 @@ use alternator_driver::{AlternatorConfig, AlternatorClient, ResponseCompression,
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .endpoint_url("http://10.0.0.1:8043")
+        .seed_hosts(["10.0.0.1"])
+        .port(8043)
         .response_compression(ResponseCompression::enabled(
             ResponseCompressionAlgorithm::Gzip,
         ))
@@ -472,4 +512,4 @@ client
 
 `alternator_config_override` currently applies only Alternator-specific compression settings: request compression and response compression. Use the AWS SDK's `config_override` separately for supported SDK-level per-operation overrides.
 
-> **Note**: load-balancing, endpoint, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression settings.
+> **Note**: load-balancing, routing, and header stripping settings cannot be overridden per-operation. They take effect only when the client is constructed. Per-operation override is limited to request/response compression settings.

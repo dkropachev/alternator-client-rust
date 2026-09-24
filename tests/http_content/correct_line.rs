@@ -88,8 +88,9 @@ pub async fn test(ctx: &mut HttpTestContext<ContextConfig>) {
     // create client
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),

@@ -43,16 +43,20 @@ fn build_with_native_ca_paths(cert_file: &Path, cert_dir: &Path) -> [BuildOutcom
     );
     let direct_https = AlternatorClient::try_from_conf(
         AlternatorConfig::builder()
+            .scheme("https")
+            .seed_hosts(["127.0.0.1"])
+            .port(8043)
+            .without_discovery()
             .behavior_version_latest()
-            .endpoint_url("https://127.0.0.1:8043")
-            .seed_hosts(Vec::<String>::new())
             .build(),
     );
     let custom_direct_https = AlternatorClient::try_from_conf(
         AlternatorConfig::builder()
+            .scheme("https")
+            .seed_hosts(["127.0.0.1"])
+            .port(8043)
+            .without_discovery()
             .behavior_version_latest()
-            .endpoint_url("https://127.0.0.1:8043")
-            .seed_hosts(Vec::<String>::new())
             .http_client(aws_smithy_http_client::Builder::new().build_http())
             .build(),
     );

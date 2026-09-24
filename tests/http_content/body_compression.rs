@@ -155,8 +155,9 @@ pub async fn test_request_compression_gzip(ctx: &mut HttpTestContext<Config>) {
     // construct client with gzip request compression enabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -205,8 +206,9 @@ pub async fn test_request_compression_deflate(ctx: &mut HttpTestContext<Config>)
     // construct client with deflate request compression enabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -284,8 +286,9 @@ pub async fn test_enabled_by_per_request_customization(ctx: &mut HttpTestContext
     // construct client with request compression disabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -394,8 +397,9 @@ pub async fn test_disabled_by_per_request_customization(ctx: &mut HttpTestContex
     // construct client with request compression enabled
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -554,8 +558,9 @@ pub async fn test_response_decompression_gzip(ctx: &mut HttpTestContext<Config>)
     // If the driver correctly decompresses the gzip response, this call succeeds.
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -597,8 +602,9 @@ pub async fn test_response_decompression_deflate(ctx: &mut HttpTestContext<Confi
     // The proxy injects Accept-Encoding: deflate so the server returns a deflate response.
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -643,8 +649,9 @@ pub async fn test_response_decompression_uncompressed_still_works(
     // This verifies that decompression logic does not break normal responses.
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -688,8 +695,9 @@ pub async fn test_response_decompression_unexpected_compression(ctx: &mut HttpTe
     // The driver should still decompress based on Content-Encoding.
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -785,8 +793,9 @@ pub async fn test_response_compression_sends_accept_encoding_gzip(
 ) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -833,8 +842,9 @@ pub async fn test_response_compression_disabled_does_not_send_accept_encoding(
 ) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -879,8 +889,9 @@ pub async fn test_response_compression_enabled_by_per_request_customization(
 ) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -929,8 +940,9 @@ pub async fn test_response_compression_disabled_by_per_request_customization(
 ) {
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
@@ -981,8 +993,9 @@ pub async fn test_response_compression_with_optimize_headers(ctx: &mut HttpTestC
     // Accept-Encoding must survive header filtering when optimize_headers is enabled.
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("http://{}", ctx.get_proxy_address()))
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
+            .without_discovery()
             .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),

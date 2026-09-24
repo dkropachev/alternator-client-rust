@@ -37,7 +37,9 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) scheme: Option<String>,
     pub(crate) port: Option<u16>,
     pub(crate) seed_hosts: Option<Vec<String>>,
-    pub(crate) endpoint_url: Option<String>,
+    /// Whether to send every request straight to the configured seed host
+    /// instead of discovering live cluster nodes through it.
+    pub(crate) without_discovery: bool,
     pub(crate) live_nodes: Option<ConfiguredLiveNodes>,
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
 }
@@ -57,6 +59,21 @@ impl ConfiguredLiveNodes {
 }
 
 impl AlternatorExtensions {
+    /// The SDK endpoint URL this configuration implies: the first seed host,
+    /// with the configured scheme and port.
+    ///
+    /// Seed hosts are the single source of routing configuration, so the AWS
+    /// SDK endpoint follows from them instead of being set on its own. A seed
+    /// host that is not a usable authority yields [`None`] here and is
+    /// reported by `LiveNodes::try_new` as `InvalidSeedHost`.
+    pub(crate) fn endpoint_url(&self) -> Option<String> {
+        let seed_host = self.seed_hosts.as_ref()?.first()?;
+        let scheme = self.scheme.as_deref().unwrap_or("http");
+        crate::live_nodes::build_seed_url(scheme, seed_host, self.port)
+            .ok()
+            .map(String::from)
+    }
+
     fn invalidate_auto_live_nodes(&mut self) {
         if matches!(self.live_nodes, Some(ConfiguredLiveNodes::AutoCreated(_))) {
             self.live_nodes = None;
@@ -88,8 +105,9 @@ fn incompatible_auth_options() -> ! {
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
+///     .seed_hosts(["127.0.0.1"])
+///     .port(8000)
 ///     .behavior_version_latest()
-///     .endpoint_url("http://127.0.0.1:8000")
 ///     // ...
 ///     .build();
 ///
@@ -243,14 +261,26 @@ impl AlternatorConfig {
     ///
     /// The seed hosts are the initial endpoints (IP addresses or hostnames) used to discover the full cluster topology.
     /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
-    /// An explicitly empty list disables discovery and requires an SDK endpoint
-    /// URL to be configured.
+    /// They are also where the AWS SDK endpoint comes from, so this is the
+    /// whole routing configuration.
     pub fn seed_hosts(&self) -> Option<Vec<String>> {
         self.alternator_ext.seed_hosts.clone()
     }
 
-    pub(crate) fn endpoint_url(&self) -> Option<&str> {
-        self.alternator_ext.endpoint_url.as_deref()
+    /// Whether client-side discovery and load balancing are turned off.
+    ///
+    /// See [`AlternatorBuilder::without_discovery`].
+    pub fn without_discovery(&self) -> bool {
+        self.alternator_ext.without_discovery
+    }
+
+    /// The URL the AWS SDK is pointed at, derived from the first seed host.
+    ///
+    /// With discovery on, requests are rewritten to the live node chosen for
+    /// them, so this only decides where a request goes when routing is turned
+    /// off through [`AlternatorBuilder::without_discovery`].
+    pub fn endpoint_url(&self) -> Option<String> {
+        self.alternator_ext.endpoint_url()
     }
 
     pub(crate) fn behavior_version(&self) -> Option<aws_sdk_dynamodb::config::BehaviorVersion> {
@@ -263,11 +293,12 @@ impl AlternatorConfig {
     /// set it via [`live_nodes`], and [`None`] means a client built from it will
     /// construct its own discovery state. On the config a client stores
     /// ([`config()`]), this is populated with that automatically created state
-    /// unless discovery was explicitly disabled with an empty seed-host list.
+    /// unless discovery was turned off with
+    /// [`without_discovery`](AlternatorBuilder::without_discovery).
     ///
     /// Rebuilding a client-stored config preserves automatically created state
     /// while changing unrelated settings. Changing a discovery setting (seed
-    /// hosts, endpoint, scheme, port, routing scope, or refresh intervals)
+    /// hosts, scheme, port, routing scope, or refresh intervals)
     /// invalidates automatically created state so the next client constructs a
     /// matching instance. A [`LiveNodes`] value supplied explicitly through
     /// [`live_nodes`] remains shared and keeps its own discovery settings.
@@ -309,8 +340,9 @@ impl AlternatorConfig {
 ///
 /// let client = AlternatorClient::from_conf(
 ///     AlternatorConfig::builder()
+///         .seed_hosts(["127.0.0.1"])
+///         .port(8000)
 ///         .behavior_version_latest()
-///         .endpoint_url("http://127.0.0.1:8000")
 ///         .build(),
 /// );
 ///
@@ -372,10 +404,10 @@ impl AlternatorOperationBuilder {
 /// meaningful for Alternator clients. AWS-specific auth schemes, auth scheme
 /// preferences, custom endpoint resolvers, FIPS endpoints, dual-stack
 /// endpoints, and account ID endpoint mode are intentionally not exposed.
-/// Use [`endpoint_url`](Self::endpoint_url) or the Alternator-specific
-/// [`scheme`](Self::scheme), [`port`](Self::port), and
-/// [`seed_hosts`](Self::seed_hosts) settings for discovery and client-side
-/// routing.
+/// Neither is the SDK endpoint URL: discovery and client-side routing are
+/// configured with the Alternator-specific [`scheme`](Self::scheme),
+/// [`port`](Self::port) and [`seed_hosts`](Self::seed_hosts) settings, and the
+/// endpoint the SDK sends to follows from them.
 ///
 /// It is used to construct [AlternatorClient] like so:
 ///
@@ -383,8 +415,9 @@ impl AlternatorOperationBuilder {
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
-///    .behavior_version_latest()
-///    .endpoint_url("http://127.0.0.1:8000")
+///     .seed_hosts(["127.0.0.1"])
+///     .port(8000)
+///     .behavior_version_latest()
 ///     // ...
 ///     .build();
 ///
@@ -400,7 +433,14 @@ impl AlternatorBuilder {
         Self::default()
     }
 
-    pub fn build(self) -> AlternatorConfig {
+    pub fn build(mut self) -> AlternatorConfig {
+        // The seed hosts are the only routing configuration there is, so the
+        // SDK endpoint is derived from them rather than set by the caller. It
+        // is what unrouted requests use, and a placeholder the routing
+        // interceptor overwrites per request when discovery is on.
+        self.dynamodb_builder
+            .set_endpoint_url(self.alternator_ext.endpoint_url());
+
         AlternatorConfig {
             dynamodb_config: self.dynamodb_builder.build(),
             alternator_ext: self.alternator_ext,
@@ -662,8 +702,14 @@ impl AlternatorBuilder {
     ///
     /// The seed hosts are the initial endpoints (IP addresses or hostnames) used to discover the full cluster topology.
     /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
-    /// An explicitly empty list disables discovery and requires an SDK endpoint
-    /// URL to be configured.
+    /// They are the only routing configuration this driver takes: the AWS SDK
+    /// endpoint follows from the first of them, so there is no separate
+    /// endpoint URL to keep in step with them.
+    ///
+    /// To send requests through a proxy or an external load balancer instead
+    /// of discovering and balancing across cluster nodes, give its address as
+    /// the single seed host and turn discovery off with
+    /// [`AlternatorBuilder::without_discovery`].
     pub fn seed_hosts<I, S>(mut self, seed_hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -675,13 +721,38 @@ impl AlternatorBuilder {
 
     /// Set the list of seed hosts for cluster discovery.
     ///
-    /// The seed hosts are the initial endpoints (IP addresses or hostnames) used to discover the full cluster topology.
-    /// Use with [`AlternatorBuilder::scheme`] and [`AlternatorBuilder::port`] to construct the endpoint URIs.
-    /// An explicitly empty list disables discovery and requires an SDK endpoint
-    /// URL to be configured.
+    /// See [`AlternatorBuilder::seed_hosts`].
     pub fn set_seed_hosts(&mut self, seed_hosts: Vec<String>) -> &mut Self {
         self.alternator_ext.invalidate_auto_live_nodes();
         self.alternator_ext.seed_hosts = Some(seed_hosts);
+        self
+    }
+
+    /// Send every request straight to the configured seed host instead of
+    /// discovering live cluster nodes through it.
+    ///
+    /// Use this when a proxy or an external load balancer sits in front of the
+    /// cluster and is the only address this client should talk to. Requests go
+    /// to the first seed host, with the configured
+    /// [`scheme`](AlternatorBuilder::scheme) and [`port`](AlternatorBuilder::port),
+    /// and no `/localnodes` discovery runs. Without a seed host to send them
+    /// to, building a client fails rather than routing anywhere unintended.
+    ///
+    /// This and [`live_nodes`](AlternatorBuilder::live_nodes) are mutually
+    /// exclusive. The last setter wins: selecting direct routing clears any
+    /// configured shared or automatically created live-node state.
+    pub fn without_discovery(mut self) -> Self {
+        self.set_without_discovery();
+        self
+    }
+
+    /// Send every request straight to the configured seed host instead of
+    /// discovering live cluster nodes through it.
+    ///
+    /// See [`AlternatorBuilder::without_discovery`].
+    pub fn set_without_discovery(&mut self) -> &mut Self {
+        self.alternator_ext.live_nodes = None;
+        self.alternator_ext.without_discovery = true;
         self
     }
 
@@ -715,6 +786,10 @@ impl AlternatorBuilder {
     /// don't have to rebuild the config yourself to inject the instance.
     ///
     /// For more information, see [`LiveNodes`].
+    ///
+    /// This and [`without_discovery`](AlternatorBuilder::without_discovery)
+    /// are mutually exclusive. The last setter wins: sharing live-node state
+    /// re-enables discovery.
     ///
     /// [`Arc`]: std::sync::Arc
     pub fn live_nodes(mut self, live_nodes: std::sync::Arc<LiveNodes>) -> Self {
@@ -753,8 +828,13 @@ impl AlternatorBuilder {
     ///
     /// For more information, see [`LiveNodes`].
     ///
+    /// This and [`without_discovery`](AlternatorBuilder::without_discovery)
+    /// are mutually exclusive. The last setter wins: sharing live-node state
+    /// re-enables discovery.
+    ///
     /// [`Arc`]: std::sync::Arc
     pub fn set_live_nodes(&mut self, live_nodes: std::sync::Arc<LiveNodes>) -> &mut Self {
+        self.alternator_ext.without_discovery = false;
         self.alternator_ext.live_nodes = Some(ConfiguredLiveNodes::ExplicitlyShared(live_nodes));
         self
     }
@@ -1195,34 +1275,6 @@ impl AlternatorBuilder {
         self
     }
 
-    pub fn endpoint_url(mut self, endpoint_url: impl Into<String>) -> Self {
-        self.set_endpoint_url(Some(endpoint_url.into()));
-        self
-    }
-
-    pub fn set_endpoint_url(&mut self, endpoint_url: Option<String>) -> &mut Self {
-        self.alternator_ext.invalidate_auto_live_nodes();
-        self.alternator_ext.endpoint_url = None;
-        // Reset everything upfront to avoid stale fields.
-        self.alternator_ext.seed_hosts = None;
-        self.alternator_ext.scheme = None;
-        self.alternator_ext.port = None;
-
-        if let Some(url_str) = endpoint_url.as_deref()
-            && let Ok(url) = url::Url::parse(url_str)
-            && let Some(host) = url.host_str()
-        {
-            self.alternator_ext.endpoint_url = Some(url_str.to_string());
-            self.set_seed_hosts(vec![host.to_string()]);
-            self.set_scheme(url.scheme());
-            if let Some(port) = url.port() {
-                self.set_port(port);
-            }
-        }
-        self.dynamodb_builder.set_endpoint_url(endpoint_url);
-        self
-    }
-
     pub fn region(mut self, region: impl Into<Option<aws_sdk_dynamodb::config::Region>>) -> Self {
         self.dynamodb_builder = self.dynamodb_builder.region(region);
         self
@@ -1424,31 +1476,85 @@ mod test {
     #[test]
     fn from_conf_does_not_panic_without_runtime() {
         let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
             .behavior_version_latest()
-            .endpoint_url("http://127.0.0.1:8000")
             .build();
         let _ = AlternatorClient::from_conf(config);
     }
 
     #[test]
-    fn endpoint_url_sets_and_clears_correctly() {
+    fn sdk_endpoint_follows_the_seed_hosts() {
         let config = AlternatorConfig::builder()
-            .endpoint_url("http://127.0.0.1:8000")
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
             .behavior_version_latest()
             .build();
+
         assert_eq!(config.seed_hosts(), Some(vec!["127.0.0.1".to_string()]));
-        assert_eq!(config.scheme(), Some("http".to_string()));
         assert_eq!(config.port(), Some(8000));
-        assert_eq!(config.endpoint_url(), Some("http://127.0.0.1:8000"));
+        assert_eq!(
+            config.endpoint_url().as_deref(),
+            Some("http://127.0.0.1:8000/")
+        );
 
-        let mut new_builder = config.to_builder();
-        new_builder.set_endpoint_url(None);
-        let new_config = new_builder.build();
+        // Seed hosts are the only routing configuration, so retargeting is a
+        // matter of setting them - and it carries through a to_builder() round
+        // trip with no second source to disagree with.
+        let retargeted = config
+            .to_builder()
+            .scheme("https")
+            .seed_hosts(["new-cluster", "other-cluster"])
+            .port(9000)
+            .build();
 
-        assert_eq!(new_config.seed_hosts(), None);
-        assert_eq!(new_config.scheme(), None);
-        assert_eq!(new_config.port(), None);
-        assert_eq!(new_config.endpoint_url(), None);
+        assert_eq!(
+            retargeted.seed_hosts(),
+            Some(vec!["new-cluster".to_string(), "other-cluster".to_string()])
+        );
+        assert_eq!(retargeted.scheme(), Some("https".to_string()));
+        assert_eq!(
+            retargeted.endpoint_url().as_deref(),
+            Some("https://new-cluster:9000/")
+        );
+
+        // A scheme shaped like a URL would supply the authority of the
+        // formatted endpoint, so it yields no endpoint instead of one pointing
+        // somewhere else entirely.
+        let url_shaped_scheme = config
+            .to_builder()
+            .scheme("https://dynamodb.us-east-1.amazonaws.com/x")
+            .build();
+
+        assert_eq!(url_shaped_scheme.endpoint_url(), None);
+    }
+
+    #[test]
+    fn without_discovery_routes_to_the_seed_host() {
+        let direct = AlternatorConfig::builder()
+            .scheme("https")
+            .seed_hosts(["load-balancer.example.com"])
+            .port(8043)
+            .without_discovery()
+            .behavior_version_latest()
+            .build();
+
+        assert!(direct.without_discovery());
+        assert_eq!(
+            direct.endpoint_url().as_deref(),
+            Some("https://load-balancer.example.com:8043/")
+        );
+        assert!(LiveNodes::try_new(&direct).unwrap().is_none());
+
+        // Without a seed host there is nothing to send requests to, so the
+        // client fails closed instead of falling back to an AWS endpoint.
+        let no_target = AlternatorConfig::builder()
+            .without_discovery()
+            .behavior_version_latest()
+            .build();
+
+        assert_eq!(no_target.endpoint_url(), None);
+        assert!(LiveNodes::try_new(&no_target).is_err());
     }
 
     #[test]
@@ -1478,8 +1584,9 @@ mod test {
     #[test]
     fn test_live_nodes_sharing() {
         let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
             .behavior_version_latest()
-            .endpoint_url("http://127.0.0.1:8000")
             .build();
 
         let live_nodes = LiveNodes::new(&config).unwrap();
@@ -1506,8 +1613,9 @@ mod test {
     fn discovery_setters_invalidate_auto_created_live_nodes() {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
                 .behavior_version_latest()
-                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
         let original = client.config().live_nodes().unwrap();
@@ -1534,11 +1642,7 @@ mod test {
                 .config()
                 .to_builder()
                 .seed_hosts(["127.0.0.2"])
-                .build(),
-            client
-                .config()
-                .to_builder()
-                .endpoint_url("http://127.0.0.2:9000")
+                .port(9000)
                 .build(),
         ];
 
@@ -1554,8 +1658,9 @@ mod test {
     fn client_derived_config_retargets_or_disables_discovery() {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
                 .behavior_version_latest()
-                .endpoint_url("http://127.0.0.1:8000")
                 .build(),
         );
 
@@ -1563,7 +1668,8 @@ mod test {
             client
                 .config()
                 .to_builder()
-                .endpoint_url("http://127.0.0.2:9000")
+                .seed_hosts(["127.0.0.2"])
+                .port(9000)
                 .build(),
         );
         let retargeted_nodes = retargeted.config().live_nodes().unwrap().get_live_nodes();
@@ -1573,8 +1679,9 @@ mod test {
             client
                 .config()
                 .to_builder()
-                .endpoint_url("http://load-balancer.example.com:8043")
-                .seed_hosts(Vec::<String>::new())
+                .seed_hosts(["load-balancer.example.com"])
+                .port(8043)
+                .without_discovery()
                 .build(),
         );
         assert!(direct.config().live_nodes().is_none());
@@ -1583,8 +1690,9 @@ mod test {
     #[test]
     fn discovery_setters_preserve_explicitly_shared_live_nodes() {
         let discovery_config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
             .behavior_version_latest()
-            .endpoint_url("http://127.0.0.1:8000")
             .build();
         let shared = LiveNodes::new(&discovery_config).unwrap();
         let client = AlternatorClient::from_conf_with_live_nodes(discovery_config, shared.clone());
@@ -1598,7 +1706,6 @@ mod test {
             .scheme("https")
             .port(9000)
             .seed_hosts(["127.0.0.2"])
-            .endpoint_url("http://127.0.0.2:9000")
             .build();
 
         assert!(std::sync::Arc::ptr_eq(
@@ -1609,6 +1716,55 @@ mod test {
         assert!(std::sync::Arc::ptr_eq(
             &shared,
             &rebuilt_client.config().live_nodes().unwrap()
+        ));
+    }
+
+    #[test]
+    fn direct_routing_and_shared_live_nodes_use_last_setter_wins() {
+        let discovery_config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .behavior_version_latest()
+            .build();
+        let shared = LiveNodes::new(&discovery_config).unwrap();
+
+        let direct_last = AlternatorConfig::builder()
+            .seed_hosts(["load-balancer.example.com"])
+            .port(8043)
+            .live_nodes(shared.clone())
+            .without_discovery()
+            .behavior_version_latest()
+            .build();
+        assert!(direct_last.without_discovery());
+        assert!(direct_last.live_nodes().is_none());
+        assert!(LiveNodes::try_new(&direct_last).unwrap().is_none());
+
+        let shared_last = AlternatorConfig::builder()
+            .seed_hosts(["load-balancer.example.com"])
+            .port(8043)
+            .without_discovery()
+            .live_nodes(shared.clone())
+            .behavior_version_latest()
+            .build();
+        assert!(!shared_last.without_discovery());
+        assert!(std::sync::Arc::ptr_eq(
+            &shared,
+            &shared_last.live_nodes().unwrap()
+        ));
+
+        let injected = AlternatorClient::from_conf_with_live_nodes(
+            AlternatorConfig::builder()
+                .seed_hosts(["load-balancer.example.com"])
+                .port(8043)
+                .without_discovery()
+                .behavior_version_latest()
+                .build(),
+            shared.clone(),
+        );
+        assert!(!injected.config().without_discovery());
+        assert!(std::sync::Arc::ptr_eq(
+            &shared,
+            &injected.config().live_nodes().unwrap()
         ));
     }
 

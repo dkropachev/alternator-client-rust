@@ -69,7 +69,9 @@ async fn test_https_discovery(ctx: &mut HttpsTestContext) {
 
     let client = AlternatorClient::from_conf(
         AlternatorConfig::builder()
-            .endpoint_url(format!("https://{}", ctx.get_proxy_address()))
+            .scheme("https")
+            .seed_hosts([ctx.get_proxy_host()])
+            .port(ctx.get_proxy_port())
             .behavior_version(BehaviorVersion::latest())
             .credentials_provider(Credentials::for_tests_with_session_token())
             .build(),
