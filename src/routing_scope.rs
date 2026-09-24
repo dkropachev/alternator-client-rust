@@ -85,7 +85,7 @@ impl RoutingScope {
 
     /// Appends the datacenter and rack parameters to the given URL as query parameters, if they are set in the scope.
     /// append_pair performs URL encoding.
-    pub fn build_localnodes_url(&self, mut base_url: url::Url) -> url::Url {
+    pub(crate) fn build_localnodes_url(&self, mut base_url: url::Url) -> url::Url {
         base_url.set_path("/localnodes");
         if self.dc.is_some() {
             let mut query = base_url.query_pairs_mut();

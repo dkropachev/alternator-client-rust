@@ -206,8 +206,9 @@ async fn connection_reused_across_discovery_test() {
         create_client_with_scope_and_interval(cluster, scope.clone(), Duration::from_millis(5));
     let target_gets_number = 10;
 
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &scope),
     )
     .await;

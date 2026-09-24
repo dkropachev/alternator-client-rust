@@ -182,6 +182,11 @@ does not change Alternator node discovery or load balancing.
 
 The client maintains a list of live nodes, which it refreshes in the background. The refresh has two cadences:
 
+Discovery state is an internal client implementation detail. `AlternatorConfig`
+stores only declarative settings; constructing multiple clients from cloned
+configurations gives each client independent discovery state and a separate
+refresh task.
+
 - **Active** (default 1s): used while the client is being called regularly.
 - **Idle** (default 60s): used when no caller has touched the client recently.
 

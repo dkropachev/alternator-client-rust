@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::live_nodes::{
-    LiveNodesBuildError, ensure_native_roots_are_usable, native_roots_are_usable,
+    LiveNodes, LiveNodesBuildError, ensure_native_roots_are_usable, native_roots_are_usable,
 };
 use crate::*;
 use aws_smithy_runtime_api::{
@@ -413,18 +413,7 @@ impl AlternatorClient {
             has_credentials_provider,
         ));
 
-        // If live nodes are not in config - create new config with live nodes.
-        let (config, live_nodes) = if let Some(nodes) = config.live_nodes() {
-            (config, Some(nodes))
-        } else if let Some(nodes) = LiveNodes::try_new(&config)? {
-            let config = config
-                .to_builder()
-                .auto_created_live_nodes(nodes.clone())
-                .build();
-            (config, Some(nodes))
-        } else {
-            (config, None)
-        };
+        let live_nodes = LiveNodes::try_new(&config)?;
 
         let uses_plaintext_transport = live_nodes
             .as_ref()
@@ -514,7 +503,7 @@ impl AlternatorClient {
 
         let dynamodb_client = try_dynamodb_client_from_conf(dynamodb_config)?;
 
-        if let Some(nodes) = live_nodes {
+        if let Some(nodes) = &live_nodes {
             nodes.ensure_discovery_started();
         }
 
@@ -522,13 +511,6 @@ impl AlternatorClient {
             dynamodb_client,
             config,
         })
-    }
-
-    pub fn from_conf_with_live_nodes(
-        config: AlternatorConfig,
-        live_nodes: std::sync::Arc<LiveNodes>,
-    ) -> Self {
-        Self::from_conf(config.to_builder().live_nodes(live_nodes).build())
     }
 
     pub fn config(&self) -> &AlternatorConfig {
