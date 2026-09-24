@@ -40,6 +40,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) endpoint_url: Option<String>,
     pub(crate) live_nodes: Option<ConfiguredLiveNodes>,
     pub(crate) key_route_affinity: Option<keyrouting::affinity_config::KeyRouteAffinityConfig>,
+    pub(crate) stalled_stream_protection_explicitly_unset: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -901,9 +902,7 @@ impl AlternatorBuilder {
         mut self,
         stalled_stream_protection_config: aws_sdk_dynamodb::config::StalledStreamProtectionConfig,
     ) -> Self {
-        self.dynamodb_builder = self
-            .dynamodb_builder
-            .stalled_stream_protection(stalled_stream_protection_config);
+        self.set_stalled_stream_protection(Some(stalled_stream_protection_config));
         self
     }
 
@@ -913,6 +912,9 @@ impl AlternatorBuilder {
             aws_sdk_dynamodb::config::StalledStreamProtectionConfig,
         >,
     ) -> &mut Self {
+        self.alternator_ext
+            .stalled_stream_protection_explicitly_unset =
+            stalled_stream_protection_config.is_none();
         self.dynamodb_builder
             .set_stalled_stream_protection(stalled_stream_protection_config);
         self

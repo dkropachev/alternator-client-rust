@@ -41,6 +41,7 @@ enum QueryPlanState {
     RoundRobin { used_nodes: HashSet<Arc<Url>> },
     /// Seeded deterministic state for Key Route Affinity
     Affinity {
+        seed: i64,
         // Boxed to prevent "large size difference between variants" warning
         go_rand: Box<GoRand>,
         remaining_nodes: Option<Vec<Arc<Url>>>,
@@ -72,6 +73,7 @@ impl QueryPlan {
         Self {
             live_nodes,
             state: Mutex::new(QueryPlanState::Affinity {
+                seed: seed as i64,
                 go_rand: Box::new(GoRand::new(seed as i64)),
                 remaining_nodes: None,
             }),
@@ -117,6 +119,7 @@ impl QueryPlan {
             QueryPlanState::Affinity {
                 go_rand,
                 remaining_nodes,
+                ..
             } => {
                 let remaining = remaining_nodes.get_or_insert_with(|| {
                     let mut nodes = self.live_nodes.get_live_nodes();
@@ -158,6 +161,47 @@ impl QueryPlan {
 
                 remaining.pop_front()
             }
+        }
+    }
+
+    /// Gets the next node to use, restarting the plan once every node has
+    /// already been tried.
+    ///
+    /// The SDK creates one plan per request and reuses it for every attempt.
+    /// A plan can therefore run out of nodes while the SDK still has retries
+    /// left, especially for a single-node cluster. Restarting keeps every
+    /// attempt routed to Alternator rather than leaving the request at the
+    /// endpoint the SDK originally resolved.
+    ///
+    /// Returns `None` only when there is no live node to route to.
+    pub fn next_node_or_restart(&self) -> Option<Arc<Url>> {
+        if let Some(node) = self.next_node() {
+            return Some(node);
+        }
+
+        self.restart();
+        self.next_node()
+    }
+
+    /// Resets strategy-specific state for another pass over the live nodes.
+    fn restart(&self) {
+        let mut state = self.state.lock().unwrap();
+
+        match &mut *state {
+            QueryPlanState::RoundRobin { used_nodes } => used_nodes.clear(),
+            QueryPlanState::Affinity {
+                seed,
+                go_rand,
+                remaining_nodes,
+            } => {
+                // Re-seeding repeats the deterministic affinity order and
+                // puts the preferred coordinator first again.
+                **go_rand = GoRand::new(*seed);
+                *remaining_nodes = None;
+            }
+            QueryPlanState::PreferredNodes {
+                remaining_nodes, ..
+            } => *remaining_nodes = None,
         }
     }
 }
@@ -237,6 +281,18 @@ mod tests {
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
             match plan.next_node() {
+                Some(node) => out.push(short_name(&node)),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Draw `count` nodes, restarting the plan when it is exhausted.
+    fn restarting_sequence(plan: &QueryPlan, count: usize) -> Vec<String> {
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            match plan.next_node_or_restart() {
                 Some(node) => out.push(short_name(&node)),
                 None => break,
             }
@@ -361,5 +417,58 @@ mod tests {
         let p1 = QueryPlan::new_with_hash(make_live_nodes(10), 42);
         let p2 = QueryPlan::new_with_hash(make_live_nodes(10), 42);
         assert_eq!(sequence(&p1, 10), sequence(&p2, 10));
+    }
+
+    #[test]
+    fn restarted_round_robin_plan_continues_shared_rotation() {
+        let plan = QueryPlan::new_basic(make_live_nodes(2));
+
+        assert_eq!(restarting_sequence(&plan, 3), ["node1", "node2", "node1"]);
+    }
+
+    #[test]
+    fn sequential_restarted_round_robin_plans_stay_balanced() {
+        let live_nodes = make_live_nodes(2);
+        let first = QueryPlan::new_basic(live_nodes.clone());
+        let second = QueryPlan::new_basic(live_nodes);
+
+        assert_eq!(restarting_sequence(&first, 3), ["node1", "node2", "node1"]);
+        assert_eq!(restarting_sequence(&second, 3), ["node2", "node1", "node2"]);
+    }
+
+    #[test]
+    fn restarted_affinity_plan_repeats_its_node_order() {
+        let plan = QueryPlan::new_with_hash(make_live_nodes(6), 42);
+        let first_pass = sequence(&plan, 6);
+        assert_eq!(first_pass.len(), 6, "plan should yield every node");
+
+        assert_eq!(restarting_sequence(&plan, 6), first_pass);
+    }
+
+    #[test]
+    fn restarted_preferred_nodes_plan_repeats_its_node_order() {
+        let live_nodes = make_live_nodes(5);
+        let preferred_3 = live_nodes
+            .get_live_nodes()
+            .into_iter()
+            .find(|node| node.host_str() == Some("node3.example.com"))
+            .expect("preferred node exists");
+        let preferred_5 = live_nodes
+            .get_live_nodes()
+            .into_iter()
+            .find(|node| node.host_str() == Some("node5.example.com"))
+            .expect("preferred node exists");
+        let plan = QueryPlan::new_with_preferred_nodes(live_nodes, vec![preferred_3, preferred_5]);
+        let first_pass = sequence(&plan, 5);
+        assert_eq!(first_pass, ["node3", "node5", "node1", "node2", "node4"]);
+
+        assert_eq!(restarting_sequence(&plan, 5), first_pass);
+    }
+
+    #[test]
+    fn restarted_plan_keeps_retrying_a_single_node() {
+        let plan = QueryPlan::new_basic(make_live_nodes(1));
+
+        assert_eq!(restarting_sequence(&plan, 3), ["node1", "node1", "node1"]);
     }
 }

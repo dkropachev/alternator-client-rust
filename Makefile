@@ -52,12 +52,16 @@ compile-test:
 test-unit:
 	$(CARGO) test --lib
 
-test-integration: scylla-start wait-for-alternator
+test-integration: .prepare-ccm
 	trap '$(CCM) remove "$(CCM_CLUSTER)"' EXIT
+	$(MAKE) --no-print-directory scylla-start
+	$(MAKE) --no-print-directory wait-for-alternator
 	$(CARGO) test --tests
 
-test-all: scylla-start wait-for-alternator
+test-all: .prepare-ccm
 	trap '$(CCM) remove "$(CCM_CLUSTER)"' EXIT
+	$(MAKE) --no-print-directory scylla-start
+	$(MAKE) --no-print-directory wait-for-alternator
 	$(CARGO) test
 	$(CCM) remove "$(CCM_CLUSTER)"
 	trap - EXIT
@@ -67,7 +71,7 @@ test-all: scylla-start wait-for-alternator
 wait-for-alternator:
 	echo "Waiting for Alternator to be ready..."
 	for i in $$(seq 1 60); do
-		if curl -sf http://localhost:8000/localnodes >/dev/null 2>&1; then
+		if curl -sf http://$(CCM_IP_PREFIX)1:8000/localnodes >/dev/null 2>&1; then
 			echo "Alternator is ready (waited $${i}s)"
 			exit 0
 		fi
