@@ -45,7 +45,8 @@ use aws_smithy_types::config_bag::ConfigBag;
 /// use alternator_driver::{AlternatorClient, AlternatorConfig};
 /// let config =
 ///     AlternatorConfig::builder()
-///    .endpoint_url("http://127.0.0.1:8000")
+///     .seed_hosts(["127.0.0.1"])
+///     .port(8000)
 ///     // ...
 ///     .build();
 ///
@@ -401,19 +402,20 @@ impl AlternatorClient {
 
         let live_nodes = LiveNodes::try_new(&config)?;
 
+        // With discovery off nothing rewrites the request, so the transport
+        // is decided by the scheme configured for the seed host itself.
+        let direct_scheme = live_nodes
+            .is_none()
+            .then(|| config.scheme().unwrap_or_else(|| "http".to_string()));
         let uses_plaintext_transport = live_nodes
             .as_ref()
             .is_some_and(|nodes| nodes.scheme() == "http")
-            || live_nodes.is_none()
-                && config
-                    .endpoint_url()
-                    .and_then(|endpoint| url::Url::parse(endpoint).ok())
-                    .is_some_and(|endpoint| endpoint.scheme() == "http");
-        let uses_direct_https_transport = live_nodes.is_none()
-            && config
-                .endpoint_url()
-                .and_then(|endpoint| url::Url::parse(endpoint).ok())
-                .is_some_and(|endpoint| endpoint.scheme() == "https");
+            || direct_scheme
+                .as_deref()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
+        let uses_direct_https_transport = direct_scheme
+            .as_deref()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"));
         let has_custom_http_client = dynamodb_config.http_client().is_some();
 
         if uses_direct_https_transport && !has_custom_http_client {
@@ -1081,7 +1083,8 @@ mod tests {
     fn test_client_adds_hooks_to_inner_client() {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
-                .endpoint_url("http://127.0.0.1:8000")
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
                 .build(),
         );
 
@@ -1103,7 +1106,8 @@ mod tests {
         let client = AlternatorClient::from_conf(
             AlternatorConfig::builder()
                 .optimize_headers(true)
-                .endpoint_url("http://127.0.0.1:8000")
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
                 .build(),
         );
 
@@ -1125,8 +1129,9 @@ mod tests {
     fn try_from_conf_pins_the_behavior_version_itself() {
         let client = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .endpoint_url("http://127.0.0.1:8000")
-                .seed_hosts(Vec::<String>::new())
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .without_discovery()
                 .build(),
         );
 
@@ -1166,7 +1171,9 @@ mod tests {
     fn try_from_conf_returns_identity_cache_validation_errors() {
         let error = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .endpoint_url("http://127.0.0.1:8000")
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .without_discovery()
                 .identity_cache(InvalidIdentityCache)
                 .build(),
         )
@@ -1190,8 +1197,9 @@ mod tests {
 
             let base_builder = || {
                 AlternatorConfig::builder()
-                    .endpoint_url("http://127.0.0.1:8000")
-                    .seed_hosts(Vec::<String>::new())
+                    .seed_hosts(["127.0.0.1"])
+                    .port(8000)
+                    .without_discovery()
             };
             let mut stalled_stream_config_unset = base_builder();
             stalled_stream_config_unset.set_stalled_stream_protection(None);
@@ -1206,7 +1214,9 @@ mod tests {
 
             let error = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .endpoint_url("http://127.0.0.1:8000")
+                    .seed_hosts(["127.0.0.1"])
+                    .port(8000)
+                    .without_discovery()
                     .http_client(InvalidHttpClient)
                     .build(),
             )
@@ -1219,8 +1229,9 @@ mod tests {
             let validation_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let client = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .endpoint_url("http://127.0.0.1:8000")
-                    .seed_hosts(Vec::<String>::new())
+                    .seed_hosts(["127.0.0.1"])
+                    .port(8000)
+                    .without_discovery()
                     .http_client(SingleValidationHttpClient(validation_count.clone()))
                     .build(),
             )
@@ -1264,8 +1275,9 @@ mod tests {
     async fn validation_adapters_preserve_per_operation_component_overrides() {
         let client = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
-                .endpoint_url("http://127.0.0.1:8000")
-                .seed_hosts(Vec::<String>::new())
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .without_discovery()
                 .identity_cache(FinalValidationIdentityCache("base identity cache used"))
                 .build(),
         )
@@ -1333,10 +1345,7 @@ mod tests {
         );
 
         let invalid_direct = AlternatorClient::try_from_conf(
-            AlternatorConfig::builder()
-                .endpoint_url("not a URL")
-                .seed_hosts(Vec::<String>::new())
-                .build(),
+            AlternatorConfig::builder().without_discovery().build(),
         )
         .unwrap_err();
         assert!(
@@ -1345,11 +1354,12 @@ mod tests {
                 .contains("no Alternator routing target")
         );
 
-        for endpoint in ["ftp://host", "ws://host"] {
+        for scheme in ["ftp", "ws"] {
             let unsupported_direct = AlternatorClient::try_from_conf(
                 AlternatorConfig::builder()
-                    .endpoint_url(endpoint)
-                    .seed_hosts(Vec::<String>::new())
+                    .scheme(scheme)
+                    .seed_hosts(["host"])
+                    .without_discovery()
                     .build(),
             )
             .unwrap_err();
