@@ -52,6 +52,8 @@ Keep the direct `aws-sdk-dynamodb` version aligned with the driver and disable
 its default features. The driver enables the current AWS SDK HTTPS client;
 enabling the SDK's legacy `rustls` feature adds an obsolete transport stack.
 
+The AWS SDK groups its defaults into dated behavior major versions and normally asks each application to pick one. This driver pins the version it is built and tested against, so there is nothing to choose and nothing to keep in sync for the clients it builds: Alternator's API does not vary with those bundles. Retry, timeout, and HTTP client settings remain individually configurable on the builder. The pin does not cover clients your application builds itself: the driver deliberately does not enable the SDK's `behavior-version-latest` feature, so any `aws_sdk_dynamodb` client you construct directly still has to set a behavior version with `.behavior_version(...)` or enable that feature on your own `aws-sdk-dynamodb` dependency.
+
 Because the Alternator Client follows the AWS SDK for DynamoDB operation builder interface for Alternator-supported features, migration usually starts by replacing `aws_sdk_dynamodb::Client` and its config type, like so:
 
 ```rust
@@ -63,7 +65,6 @@ async fn main() {
     // Build an AlternatorConfig instead of an aws_sdk_dynamodb::Config.
     let config = AlternatorConfig::builder() // <-- was aws_sdk_dynamodb::Config::builder()
         .endpoint_url("http://localhost:8000")
-        .behavior_version_latest()
         .build();
 
     // Build an AlternatorClient instead of an aws_sdk_dynamodb::Client.
@@ -87,7 +88,7 @@ This client targets ScyllaDB Alternator. It does not guarantee that Alternator-s
 
 ### Supported configuration surface
 
-Build clients with `AlternatorConfig::builder()` and set Alternator behavior explicitly. The driver intentionally does not import shared `aws_types::SdkConfig` values, because shared SDK config can contain AWS-specific auth and endpoint settings that do not map cleanly to Alternator.
+Build clients with `AlternatorConfig::builder()` and configure Alternator explicitly. The driver intentionally does not import shared `aws_types::SdkConfig` values, because shared SDK config can contain AWS-specific auth and endpoint settings that do not map cleanly to Alternator.
 
 There is no `AlternatorClient::new(&SdkConfig)`, `AlternatorConfig::new(&SdkConfig)`, or `AlternatorConfig::from(&SdkConfig)` shortcut. Start from `AlternatorConfig::builder()` and copy only the supported SDK settings your client needs, such as `region(...)`, `credentials_provider(...)`, `retry_config(...)`, `timeout_config(...)`, `http_client(...)`, `app_name(...)`, or `interceptor(...)`.
 
@@ -115,7 +116,6 @@ use alternator_driver::AlternatorConfig;
 
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
-    .behavior_version_latest()
     .build();
 ```
 
@@ -134,7 +134,6 @@ let config = AlternatorConfig::builder()
         "10.0.0.2",
         "10.0.0.3",
     ])
-    .behavior_version_latest()
     .build();
 ```
 
@@ -206,7 +205,6 @@ let scope = RoutingScope::from_cluster();
 let config = AlternatorConfig::builder()
     .endpoint_url("http://10.0.0.1:8043")
     .routing_scope(scope)
-    .behavior_version_latest()
     .build();
 ```
 
@@ -289,7 +287,6 @@ let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(KeyRouteAffinityType::Rmw)
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -311,7 +308,6 @@ let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .key_route_affinity(affinity)
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -336,7 +332,6 @@ let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .user_agent("orders-service/1.0")
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -352,7 +347,6 @@ let client = AlternatorClient::from_conf(
         .user_agent(UserAgent::transform(|default| {
             format!("{default} orders-service/1.0")
         }))
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -366,7 +360,6 @@ let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .without_user_agent()
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -394,7 +387,6 @@ let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
         .endpoint_url("http://10.0.0.1:8043")
         .optimize_headers(false)
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -415,7 +407,6 @@ let client = AlternatorClient::from_conf(
             CompressionLevel::default(),
             1024, // body-size threshold in bytes
         ))
-        .behavior_version_latest()
         .build(),
 );
 ```
@@ -436,7 +427,6 @@ let client = AlternatorClient::from_conf(
         .response_compression(ResponseCompression::enabled(
             ResponseCompressionAlgorithm::Gzip,
         ))
-        .behavior_version_latest()
         .allow_no_auth()
         .build(),
 );

@@ -475,7 +475,7 @@ impl Intercept for AffinityQueryPlanInterceptor {
 mod tests {
     use super::*;
     use crate::keyrouting::KeyRouteAffinityType;
-    use aws_sdk_dynamodb::config::{BehaviorVersion, Region};
+    use aws_sdk_dynamodb::config::Region;
     use aws_sdk_dynamodb::operation::batch_write_item::BatchWriteItemInput;
     use aws_sdk_dynamodb::types::{AttributeValue, DeleteRequest, PutRequest, WriteRequest};
     use aws_smithy_runtime_api::client::interceptors::context::InterceptorContext;
@@ -489,7 +489,7 @@ mod tests {
 
     fn make_client() -> aws_sdk_dynamodb::Client {
         let config = aws_sdk_dynamodb::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
+            .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
             .region(Region::new("us-east-1"))
             .endpoint_url("http://127.0.0.1:1")
             .build();

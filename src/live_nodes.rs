@@ -702,7 +702,6 @@ mod tests {
 
     fn test_config() -> AlternatorConfig {
         AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:1".to_string())
             .build()
     }
@@ -818,7 +817,6 @@ mod tests {
     fn discovery_restarts_after_its_runtime_is_dropped() {
         let (port, request_count, server) = start_runtime_restart_server();
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url(format!("http://127.0.0.1:{port}"))
             .active_interval(Duration::from_secs(60 * 60))
             .idle_interval(Duration::from_secs(60 * 60))
@@ -889,7 +887,6 @@ mod tests {
     fn first_access_hands_discovery_off_after_background_runtime_shutdown() {
         let (port, request_count, server) = start_runtime_restart_server();
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url(format!("http://127.0.0.1:{port}"))
             .active_interval(Duration::from_secs(60 * 60))
             .idle_interval(Duration::from_secs(60 * 60))
@@ -982,7 +979,6 @@ mod tests {
     #[test]
     fn empty_seed_hosts_with_an_endpoint_disable_discovery() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("http://127.0.0.1:8000")
             .seed_hosts(Vec::<String>::new())
             .build();
@@ -997,7 +993,6 @@ mod tests {
             [("ftp://host", "http", "ftp"), ("ws://host", "https", "ws")]
         {
             let config = AlternatorConfig::builder()
-                .behavior_version_latest()
                 .endpoint_url(endpoint)
                 .seed_hosts(Vec::<String>::new())
                 .scheme(discovery_scheme)
@@ -1012,7 +1007,6 @@ mod tests {
         }
 
         let direct_http = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("http://host")
             .seed_hosts(Vec::<String>::new())
             .scheme("ftp")
@@ -1024,7 +1018,6 @@ mod tests {
     #[test]
     fn custom_http_client_defers_direct_scheme_validation() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("custom://host")
             .seed_hosts(Vec::<String>::new())
             .http_client(aws_smithy_http_client::Builder::new().build_http())
@@ -1036,9 +1029,7 @@ mod tests {
 
     #[test]
     fn missing_seed_hosts_and_endpoint_are_rejected() {
-        let config = AlternatorConfig::builder()
-            .behavior_version_latest()
-            .build();
+        let config = AlternatorConfig::builder().build();
 
         assert!(matches!(
             LiveNodes::try_new(&config),
@@ -1050,7 +1041,6 @@ mod tests {
     #[should_panic(expected = "invalid seed host")]
     fn malformed_seed_host_fails_closed_even_when_another_seed_is_valid() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .seed_hosts(["127.0.0.1", "127.0.0.1:invalid"])
             .build();
@@ -1068,7 +1058,6 @@ mod tests {
             "example.com:8000",
         ] {
             let config = AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme("http")
                 .seed_hosts([seed_host])
                 .build();
@@ -1084,7 +1073,6 @@ mod tests {
     fn discovery_rejects_unsupported_and_url_shaped_schemes() {
         for scheme in ["ftp", "https://dynamodb.us-east-1.amazonaws.com/x"] {
             let config = AlternatorConfig::builder()
-                .behavior_version_latest()
                 .scheme(scheme)
                 .seed_hosts(["127.0.0.1"])
                 .build();
@@ -1099,7 +1087,6 @@ mod tests {
     #[test]
     fn ipv6_address_parsing() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .endpoint_url("http://[::1]:8000".to_string())
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
@@ -1112,7 +1099,6 @@ mod tests {
     #[test]
     fn raw_ipv6_seed_host_is_bracketed() {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(8000)
             .seed_hosts(["::1"])
@@ -1127,7 +1113,6 @@ mod tests {
     async fn raw_ipv6_seed_discovers_raw_ipv6_node() {
         let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["::1"])
@@ -1147,7 +1132,6 @@ mod tests {
     async fn dns_entrypoint_discovers_dns_node_records() {
         let (port, server) = start_localnodes_server(r#"["localhost","node-a.internal"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(vec!["localhost".to_string()])
@@ -1172,7 +1156,6 @@ mod tests {
         let (port, server) =
             start_localnodes_server(r#"["node-a.internal:9000","node-b.internal"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(vec!["localhost".to_string()])
@@ -1266,7 +1249,6 @@ mod tests {
     async fn refresh_recovers_through_original_raw_ipv6_seed() {
         let (port, server) = start_localnodes_server_on("[::1]:0", "[::1]", r#"["::1"]"#).await;
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["::1"])
@@ -1329,7 +1311,6 @@ mod tests {
 
     fn dns_live_nodes(port: u16, resolved_ips: &[IpAddr]) -> Arc<LiveNodes> {
         let config = AlternatorConfig::builder()
-            .behavior_version_latest()
             .scheme("http")
             .port(port)
             .seed_hosts(["dual.test"])
