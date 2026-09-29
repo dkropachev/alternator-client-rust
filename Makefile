@@ -3,13 +3,47 @@ SHELL := bash
 .SHELLFLAGS := -eo pipefail -c
 
 CARGO ?= cargo
+CURL ?= curl
 CARGO_HEATHER_VERSION := 0.3.0
 CCM ?= ccm
 CCM_CLUSTER ?= alternator-client-rust
 CCM_IP_PREFIX ?= 127.0.0.
 CCM_NODE ?= node1
 CCM_SCYLLA_VERSION ?= release:2026.1
+ALTERNATOR_TEST_ADDRESS ?= $(CCM_IP_PREFIX)1:8000
+ALTERNATOR_READY_TIMEOUT ?= 60
 RUSTFLAGS_CCM ?= --cfg ccm_tests
+
+define SCYLLA_START_COMMANDS
+$(CCM) remove "$(CCM_CLUSTER)" >/dev/null 2>&1 || true
+$(CCM) create "$(CCM_CLUSTER)" -n 1 -i "$(CCM_IP_PREFIX)" --scylla -v "$(CCM_SCYLLA_VERSION)"
+$(CCM) "$(CCM_NODE)" updateconf \
+	alternator_address:$(CCM_IP_PREFIX)1 \
+	alternator_port:8000 \
+	alternator_write_isolation:always \
+	alternator_response_gzip_compression_level:6 \
+	alternator_response_compression_threshold_in_bytes:1
+$(CCM) start --wait-for-binary-proto --wait-other-notice
+endef
+
+define WAIT_FOR_ALTERNATOR_COMMANDS
+echo "Waiting for Alternator to be ready..."
+ready=false
+started=$$SECONDS
+deadline=$$((started + $(ALTERNATOR_READY_TIMEOUT)))
+while (( SECONDS < deadline )); do
+	if $(CURL) -sf --connect-timeout 1 --max-time 1 "http://$(ALTERNATOR_TEST_ADDRESS)/localnodes" >/dev/null 2>&1; then
+		echo "Alternator is ready (waited $$((SECONDS - started))s)"
+		ready=true
+		break
+	fi
+	sleep 1
+done
+if [[ "$$ready" != true ]]; then
+	echo "Timed out waiting for Alternator"
+	exit 1
+fi
+endef
 
 .PHONY: clean verify lint lint-docs lint-fix license-install license-check license-fix compile compile-test
 .PHONY: test-unit test-integration test-all
@@ -52,33 +86,24 @@ compile-test:
 test-unit:
 	$(CARGO) test --lib
 
-test-integration: .prepare-ccm
+test-integration: .prepare-ccm .prepare-environment-update-aio-max-nr
 	trap '$(CCM) remove "$(CCM_CLUSTER)"' EXIT
-	$(MAKE) --no-print-directory scylla-start
-	$(MAKE) --no-print-directory wait-for-alternator
-	$(CARGO) test --tests
+	$(SCYLLA_START_COMMANDS)
+	$(WAIT_FOR_ALTERNATOR_COMMANDS)
+	ALTERNATOR_TEST_ADDRESS="$(ALTERNATOR_TEST_ADDRESS)" $(CARGO) test --tests
 
-test-all: .prepare-ccm
+test-all: .prepare-ccm .prepare-environment-update-aio-max-nr
 	trap '$(CCM) remove "$(CCM_CLUSTER)"' EXIT
-	$(MAKE) --no-print-directory scylla-start
-	$(MAKE) --no-print-directory wait-for-alternator
-	$(CARGO) test
+	$(SCYLLA_START_COMMANDS)
+	$(WAIT_FOR_ALTERNATOR_COMMANDS)
+	ALTERNATOR_TEST_ADDRESS="$(ALTERNATOR_TEST_ADDRESS)" $(CARGO) test
 	$(CCM) remove "$(CCM_CLUSTER)"
 	trap - EXIT
 	RUSTFLAGS="$(RUSTFLAGS_CCM)" $(CARGO) test --test ccm_wrapper_tests -- --nocapture
 	RUSTFLAGS="$(RUSTFLAGS_CCM)" $(CARGO) test --test load_balancing_tests -- --nocapture
 
 wait-for-alternator:
-	echo "Waiting for Alternator to be ready..."
-	for i in $$(seq 1 60); do
-		if curl -sf http://$(CCM_IP_PREFIX)1:8000/localnodes >/dev/null 2>&1; then
-			echo "Alternator is ready (waited $${i}s)"
-			exit 0
-		fi
-		sleep 1
-	done
-	echo "Timed out waiting for Alternator"
-	exit 1
+	$(WAIT_FOR_ALTERNATOR_COMMANDS)
 
 .prepare-environment-update-aio-max-nr:
 	@if [[ -r /proc/sys/fs/aio-max-nr ]] && (( $$(< /proc/sys/fs/aio-max-nr) < 2097152 )); then
@@ -89,15 +114,7 @@ wait-for-alternator:
 	@command -v "$(CCM)" >/dev/null || { echo "ccm is required; install scylla-ccm first"; exit 127; }
 
 scylla-start: .prepare-ccm .prepare-environment-update-aio-max-nr
-	$(CCM) remove "$(CCM_CLUSTER)" >/dev/null 2>&1 || true
-	$(CCM) create "$(CCM_CLUSTER)" -n 1 -i "$(CCM_IP_PREFIX)" --scylla -v "$(CCM_SCYLLA_VERSION)"
-	$(CCM) "$(CCM_NODE)" updateconf \
-		alternator_address:$(CCM_IP_PREFIX)1 \
-		alternator_port:8000 \
-		alternator_write_isolation:always \
-		alternator_response_gzip_compression_level:6 \
-		alternator_response_compression_threshold_in_bytes:1
-	$(CCM) start --wait-for-binary-proto --wait-other-notice
+	$(SCYLLA_START_COMMANDS)
 
 scylla-stop: .prepare-ccm
 	$(CCM) switch "$(CCM_CLUSTER)"

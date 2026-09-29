@@ -62,7 +62,12 @@ use tokio::task::JoinHandle;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 
-const ALTERNATOR_ADDRESS: &str = "localhost:8000";
+const DEFAULT_ALTERNATOR_ADDRESS: &str = "localhost:8000";
+
+fn alternator_address() -> String {
+    std::env::var("ALTERNATOR_TEST_ADDRESS")
+        .unwrap_or_else(|_| DEFAULT_ALTERNATOR_ADDRESS.to_string())
+}
 
 pub trait HttpTestConfig: Send {
     fn cleanup(resources: Vec<String>, alternator_address: &str)
@@ -89,11 +94,13 @@ pub struct HttpTestContext<Config: HttpTestConfig> {
     on_request: Arc<Mutex<OnRequest>>,
     proxy_handle: JoinHandle<()>,
     proxy_address: String,
+    alternator_address: String,
     resources: Vec<String>,
     _pd: PhantomData<Config>,
 }
 impl<Config: HttpTestConfig> AsyncTestContext for HttpTestContext<Config> {
     async fn setup() -> Self {
+        let alternator_address = alternator_address();
         // swappable on_request
         let initial: OnRequest =
             Box::new(|request, sender| Config::on_request(request, sender).boxed());
@@ -109,7 +116,7 @@ impl<Config: HttpTestConfig> AsyncTestContext for HttpTestContext<Config> {
         // start proxy
         let proxy = Proxy::start(
             "localhost:0".to_string(), // let OS choose port
-            ALTERNATOR_ADDRESS.to_string(),
+            alternator_address.clone(),
             on_request,
             None,
             None,
@@ -124,13 +131,14 @@ impl<Config: HttpTestConfig> AsyncTestContext for HttpTestContext<Config> {
             on_request: inner,
             proxy_handle: handle,
             proxy_address: address,
+            alternator_address,
             resources: vec![],
             _pd: PhantomData,
         }
     }
 
     async fn teardown(self) {
-        Config::cleanup(self.resources, ALTERNATOR_ADDRESS).await;
+        Config::cleanup(self.resources, &self.alternator_address).await;
         self.proxy_handle.abort();
     }
 }
