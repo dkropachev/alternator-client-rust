@@ -255,7 +255,7 @@ Each `.with_fallback(...)` call appends to the end of the chain, so the order in
 
 ### Load balancing strategies
 
-For every request, the client picks a node and rewrites the request URI to point at that node before signing. The default strategy is round-robin across the live nodes. Requests and retries share the same rotation, and retries skip nodes already tried for the current request.
+For every request, the client picks a node and rewrites the request URI to point at that node before signing. The default strategy is round-robin across the live nodes. Requests and retries share the same rotation. Retries skip nodes already tried for the current request until every live node has been tried, then start another pass through the plan.
 
 Round-robin is the right default for the vast majority of workloads. For workloads that perform many LWTs against the same partition keys, see [Key route affinity](#key-route-affinity) below.
 

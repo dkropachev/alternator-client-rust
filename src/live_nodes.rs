@@ -51,7 +51,10 @@
 //! For cluster-wide scope, the refresh queries `/localnodes` from configured
 //! seed nodes and already-known live nodes, then unions the responses. To cover
 //! all datacenters, the initial configuration must include at least one working
-//! seed host from every datacenter that should receive traffic.
+//! seed host from every datacenter that should receive traffic. Each non-empty
+//! response is published as a union with the current snapshot so responsive
+//! datacenters become routable without waiting for every stale candidate. The
+//! completed union replaces that partial snapshot after the pass finishes.
 //!
 //! Once it successfully gets a non-empty response, it atomically updates the [`live_nodes`] list using [`ArcSwap`].
 //!
@@ -75,8 +78,8 @@
 //! 2. If no Tokio runtime is available on the current thread, return without spawning.
 //!    The task will be started lazily on the first [`get_next_node_round_robin`] or [`get_live_nodes`] call,
 //!    which is typically invoked from within the request pipeline and therefore from within a runtime.
-//! 3. An atomic registration plus a mutex on the cold start or confirmed
-//!    shutdown path ensures that exactly one caller starts the task. A
+//! 3. An atomic registration plus a mutex on the cold-start or handoff path
+//!    ensures that exactly one caller starts the task. A
 //!    task-owned guard clears only its registration when it exits.
 //!
 //! [`AlternatorConfig`]: crate::config::AlternatorConfig
@@ -101,7 +104,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use futures_util::FutureExt;
 use rand::seq::SliceRandom;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -250,6 +253,7 @@ pub struct LiveNodes {
     idle_interval: Duration,
     counter: Arc<AtomicUsize>,
     live_nodes: ArcSwap<Vec<Arc<Url>>>,
+    refresh_state: Mutex<RefreshState>,
     seed_urls: Vec<Arc<Url>>,
     alternator_scheme: String,
     port: Option<u16>,
@@ -261,22 +265,119 @@ pub struct LiveNodes {
     discovery_runtime: ArcSwapOption<DiscoveryRuntime>,
 }
 
+/// How long a successful or pending probe keeps the owning runtime eligible.
+///
+/// [`LiveNodes::ensure_discovery_started`] runs on every request, so an
+/// unconditional probe would put a blocking-pool task on the routing path of
+/// every request made from a runtime that does not own discovery. Handing
+/// discovery over this much later than shutdown is harmless next to refresh
+/// intervals measured in seconds. A probe still pending after this interval
+/// also triggers handoff, bounding the blocking queue under saturation.
+const SHUTDOWN_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
 #[derive(Debug)]
 struct DiscoveryRuntime {
     id: tokio::runtime::Id,
     handle: Handle,
+    /// Once this registration needs handoff, it must never become the active
+    /// owner again even if its runtime later recovers from blocking-pool
+    /// saturation.
+    handoff_required: AtomicBool,
+    shutdown_probe: Mutex<ShutdownProbe>,
+}
+
+#[derive(Debug, Default)]
+struct ShutdownProbe {
+    last_started: Option<Instant>,
+    pending: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ShutdownProbe {
+    fn is_due(&self, now: Instant) -> bool {
+        self.last_started
+            .is_none_or(|started| now.saturating_duration_since(started) >= SHUTDOWN_PROBE_INTERVAL)
+    }
+}
+
+#[derive(Debug, Default)]
+struct RefreshState {
+    next_generation: u64,
+    latest_published_generation: u64,
 }
 
 impl DiscoveryRuntime {
-    fn is_shutdown(&self) -> bool {
+    fn new(id: tokio::runtime::Id, handle: Handle) -> Self {
+        Self {
+            id,
+            handle,
+            handoff_required: AtomicBool::new(false),
+            shutdown_probe: Mutex::new(ShutdownProbe::default()),
+        }
+    }
+
+    fn should_handoff(&self) -> bool {
+        self.should_handoff_at(Instant::now())
+    }
+
+    fn should_handoff_at(&self, now: Instant) -> bool {
+        if self.handoff_required.load(Ordering::Acquire) {
+            return true;
+        }
+
+        let mut probe_state = self
+            .shutdown_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.handoff_required.load(Ordering::Acquire) {
+            return true;
+        }
+        if let Some(result) = probe_state
+            .pending
+            .as_mut()
+            .and_then(|probe| probe.now_or_never())
+        {
+            probe_state.pending = None;
+            if matches!(result, Err(error) if error.is_cancelled()) {
+                self.handoff_required.store(true, Ordering::Release);
+                return true;
+            }
+        } else if probe_state.pending.is_some() {
+            if !probe_state.is_due(now) {
+                return false;
+            }
+
+            // A pre-shutdown probe can remain queued forever behind a blocking
+            // task. Replacing it every interval would grow Tokio's blocking
+            // queue without bound, so one stale probe instead makes this
+            // registration ineligible and lets a caller runtime take over.
+            probe_state.pending.take().unwrap().abort();
+            self.handoff_required.store(true, Ordering::Release);
+            return true;
+        }
+
+        if !probe_state.is_due(now) {
+            return false;
+        }
+        probe_state.last_started = Some(now);
+
         // A live blocking pool either runs this closure or leaves it pending.
         // Once runtime shutdown starts, spawn_blocking rejects it synchronously
         // with a cancelled JoinError. Unlike an async probe, this still works
         // while an async worker cannot drop the discovery task's guard.
-        matches!(
-            self.handle.spawn_blocking(|| ()).now_or_never(),
-            Some(Err(error)) if error.is_cancelled()
-        )
+        let mut probe = self.handle.spawn_blocking(|| ());
+        let shutdown = match (&mut probe).now_or_never() {
+            Some(Err(error)) if error.is_cancelled() => true,
+            Some(_) => false,
+            None => {
+                probe_state.pending = Some(probe);
+                false
+            }
+        };
+        if shutdown {
+            self.handoff_required.store(true, Ordering::Release);
+        }
+
+        shutdown
     }
 }
 
@@ -378,6 +479,7 @@ impl LiveNodes {
             idle_interval,
             counter: Arc::new(AtomicUsize::new(0)),
             live_nodes: ArcSwap::from_pointee(seed_urls.clone()),
+            refresh_state: Mutex::new(RefreshState::default()),
             seed_urls,
             alternator_scheme,
             port,
@@ -436,21 +538,68 @@ impl LiveNodes {
         candidates
     }
 
-    async fn discover_cluster_live_nodes(&self) -> Option<Vec<Arc<Url>>> {
+    fn begin_refresh(&self) -> u64 {
+        let mut state = self
+            .refresh_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.next_generation = state
+            .next_generation
+            .checked_add(1)
+            .expect("live-node refresh generation overflowed");
+        state.next_generation
+    }
+
+    async fn discover_cluster_live_nodes(&self, generation: u64) -> Option<Vec<Arc<Url>>> {
+        self.discover_cluster_live_nodes_from(generation, self.cluster_discovery_candidates())
+            .await
+    }
+
+    fn publish_partial_cluster_live_nodes(&self, generation: u64, discovered: &[Arc<Url>]) {
+        let mut state = self
+            .refresh_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generation < state.latest_published_generation {
+            return;
+        }
+
+        let current = self.live_nodes.load_full();
+        let mut partial = Vec::with_capacity(current.len() + discovered.len());
+        partial.extend(current.iter().cloned());
+        partial.extend(discovered.iter().cloned());
+        partial.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        partial.dedup_by(|a, b| a.as_str() == b.as_str());
+
+        if current.as_ref() != &partial {
+            self.live_nodes.store(Arc::new(partial));
+        }
+        state.latest_published_generation = generation;
+    }
+
+    async fn discover_cluster_live_nodes_from(
+        &self,
+        generation: u64,
+        candidates: Vec<Arc<Url>>,
+    ) -> Option<Vec<Arc<Url>>> {
         let scope = RoutingScope::from_cluster();
         let mut new_nodes = Vec::new();
         let mut got_response = false;
 
-        for node_addr in self.cluster_discovery_candidates() {
+        for node_addr in candidates {
             if node_is_in_list(&node_addr, &new_nodes) {
                 continue;
             }
 
             if let Some(mut nodes) = self.fetch_live_nodes_for_scope(&scope, &node_addr).await {
                 got_response = true;
+                let response_was_nonempty = !nodes.is_empty();
                 new_nodes.append(&mut nodes);
                 new_nodes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 new_nodes.dedup_by(|a, b| a.as_str() == b.as_str());
+                if response_was_nonempty {
+                    self.publish_partial_cluster_live_nodes(generation, &new_nodes);
+                }
             }
         }
 
@@ -469,20 +618,20 @@ impl LiveNodes {
     /// discovery is already running on a live Tokio runtime, or if no runtime
     /// is available. A caller on another runtime keeps a healthy owner stable,
     /// but takes ownership when a probe confirms that the old runtime has shut
-    /// down.
+    /// down or cannot service the probe within the bounded interval.
     pub fn ensure_discovery_started(self: &Arc<Self>) {
         let Ok(handle) = Handle::try_current() else {
             return;
         };
         let runtime_id = handle.id();
         // Requests on the owning runtime never take the start/transfer mutex.
-        // A caller on another runtime transfers only after a probe spawned on
-        // the owner is synchronously rejected because its scheduler is closed.
+        // A caller on another runtime transfers only after the owner rejects a
+        // probe or leaves it pending beyond the bounded liveness interval.
         if self
             .discovery_runtime
             .load()
             .as_ref()
-            .is_some_and(|active| active.id == runtime_id || !active.is_shutdown())
+            .is_some_and(|active| active.id == runtime_id || !active.should_handoff())
         {
             return;
         }
@@ -494,7 +643,7 @@ impl LiveNodes {
             .discovery_runtime
             .load()
             .as_ref()
-            .is_some_and(|active| active.id == runtime_id || !active.is_shutdown())
+            .is_some_and(|active| active.id == runtime_id || !active.should_handoff())
         {
             return;
         }
@@ -503,10 +652,7 @@ impl LiveNodes {
             old_task.abort();
         }
 
-        let runtime = Arc::new(DiscoveryRuntime {
-            id: runtime_id,
-            handle: handle.clone(),
-        });
+        let runtime = Arc::new(DiscoveryRuntime::new(runtime_id, handle.clone()));
         self.discovery_runtime.store(Some(runtime.clone()));
         let weak_self = Arc::downgrade(self);
         let notify = self.notify.clone();
@@ -579,6 +725,13 @@ impl LiveNodes {
             return None;
         }
 
+        // Checking an exhausted query plan must not advance the shared
+        // round-robin position. The caller may clear `used_nodes` and retry,
+        // and that retry should consume the next position itself.
+        if live_nodes.iter().all(|node| used_nodes.contains(node)) {
+            return None;
+        }
+
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % len;
         for i in 0..len {
             let idx = (start + i) % len;
@@ -591,6 +744,7 @@ impl LiveNodes {
     }
 
     pub async fn update_live_nodes(&self) {
+        let generation = self.begin_refresh();
         let mut scope = &self.routing_scope;
         // Live nodes in a random order.
         let mut nodes = self.live_nodes.load().as_ref().clone();
@@ -600,7 +754,7 @@ impl LiveNodes {
 
         while let Some(node_addr) = candidates.pop_front() {
             if scope.is_cluster() {
-                let Some(new_nodes) = self.discover_cluster_live_nodes().await else {
+                let Some(new_nodes) = self.discover_cluster_live_nodes(generation).await else {
                     return;
                 };
 
@@ -613,9 +767,7 @@ impl LiveNodes {
                     continue;
                 }
 
-                if **self.live_nodes.load() != new_nodes {
-                    self.live_nodes.store(Arc::new(new_nodes));
-                }
+                self.publish_live_nodes(generation, new_nodes);
                 return;
             }
 
@@ -640,11 +792,23 @@ impl LiveNodes {
                 continue;
             }
 
-            if **self.live_nodes.load() != new_nodes {
-                self.live_nodes.store(Arc::new(new_nodes));
-            }
+            self.publish_live_nodes(generation, new_nodes);
             return;
         }
+    }
+
+    fn publish_live_nodes(&self, generation: u64, new_nodes: Vec<Arc<Url>>) {
+        let mut state = self
+            .refresh_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if generation < state.latest_published_generation {
+            return;
+        }
+        if **self.live_nodes.load() != new_nodes {
+            self.live_nodes.store(Arc::new(new_nodes));
+        }
+        state.latest_published_generation = generation;
     }
 }
 
@@ -947,18 +1111,105 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_probe_interval_is_rate_limited() {
+        let started = Instant::now();
+        let probe = ShutdownProbe {
+            last_started: Some(started),
+            ..Default::default()
+        };
+
+        assert!(!probe.is_due(started));
+        assert!(!probe.is_due(started + SHUTDOWN_PROBE_INTERVAL - Duration::from_nanos(1)));
+        assert!(probe.is_due(started + SHUTDOWN_PROBE_INTERVAL));
+    }
+
+    #[test]
+    fn shutdown_probe_handoff_is_latched() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let discovery_runtime =
+            DiscoveryRuntime::new(runtime.handle().id(), runtime.handle().clone());
+
+        runtime.shutdown_background();
+
+        assert!(discovery_runtime.should_handoff());
+        assert!(discovery_runtime.handoff_required.load(Ordering::Acquire));
+        assert!(discovery_runtime.should_handoff());
+    }
+
+    #[test]
+    fn pending_shutdown_probe_is_bounded_and_does_not_block_handoff() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+        let (blocker_done_tx, blocker_done_rx) = std::sync::mpsc::sync_channel(0);
+        let _blocker = runtime.spawn_blocking(move || {
+            blocker_started_tx.send(()).unwrap();
+            release_blocker_rx.recv().unwrap();
+            blocker_done_tx.send(()).unwrap();
+        });
+        blocker_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking pool was not saturated");
+
+        let discovery_runtime =
+            DiscoveryRuntime::new(runtime.handle().id(), runtime.handle().clone());
+        let started = Instant::now();
+        assert!(!discovery_runtime.should_handoff_at(started));
+        let first_probe_id = discovery_runtime
+            .shutdown_probe
+            .lock()
+            .unwrap()
+            .pending
+            .as_ref()
+            .expect("probe should be queued behind the blocker")
+            .id();
+
+        for _ in 0..10 {
+            assert!(!discovery_runtime.should_handoff_at(started));
+        }
+        let current_probe_id = discovery_runtime
+            .shutdown_probe
+            .lock()
+            .unwrap()
+            .pending
+            .as_ref()
+            .expect("one shutdown probe should remain queued")
+            .id();
+        assert_eq!(
+            first_probe_id, current_probe_id,
+            "a saturated blocking pool must retain one probe instead of queuing replacements"
+        );
+
+        runtime.shutdown_background();
+        assert!(
+            discovery_runtime.should_handoff_at(started + SHUTDOWN_PROBE_INTERVAL),
+            "a stale pre-shutdown probe must not prevent runtime handoff"
+        );
+
+        release_blocker_tx.send(()).unwrap();
+        blocker_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking task did not finish");
+    }
+
+    #[test]
     fn stale_task_guard_does_not_clear_replacement_registration() {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         let first_runtime = tokio::runtime::Runtime::new().unwrap();
         let second_runtime = tokio::runtime::Runtime::new().unwrap();
-        let first = Arc::new(DiscoveryRuntime {
-            id: first_runtime.handle().id(),
-            handle: first_runtime.handle().clone(),
-        });
-        let second = Arc::new(DiscoveryRuntime {
-            id: second_runtime.handle().id(),
-            handle: second_runtime.handle().clone(),
-        });
+        let first = Arc::new(DiscoveryRuntime::new(
+            first_runtime.handle().id(),
+            first_runtime.handle().clone(),
+        ));
+        let second = Arc::new(DiscoveryRuntime::new(
+            second_runtime.handle().id(),
+            second_runtime.handle().clone(),
+        ));
 
         nodes.discovery_runtime.store(Some(first.clone()));
         let stale_guard = DiscoveryTaskGuard {
@@ -1227,6 +1478,166 @@ mod tests {
             ],
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn cluster_discovery_publishes_safe_partial_union_before_stalled_candidate_finishes() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_stalled = stalled.clone();
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            let (mut responsive, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let n = responsive.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+            assert!(
+                request.contains(&format!("host: 127.0.0.1:{port}"))
+                    || request.contains(&format!("Host: 127.0.0.1:{port}"))
+            );
+
+            let body = r#"["127.0.0.3"]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            responsive.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut blackhole, _) = listener.accept().await.unwrap();
+            let n = blackhole.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
+            assert!(
+                request.contains(&format!("host: 127.0.0.2:{port}"))
+                    || request.contains(&format!("Host: 127.0.0.2:{port}"))
+            );
+            server_stalled.notify_one();
+            server_release.notified().await;
+        });
+
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["127.0.0.1"])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+        let stale = Arc::new(Url::parse(&format!("http://127.0.0.2:{port}/")).unwrap());
+        let healthy = Arc::new(Url::parse(&format!("http://127.0.0.3:{port}/")).unwrap());
+        nodes.live_nodes.store(Arc::new(vec![stale.clone()]));
+        let candidates = vec![nodes.seed_urls[0].clone(), stale.clone()];
+        let generation = nodes.begin_refresh();
+        let discovery_nodes = nodes.clone();
+        let discovery = tokio::spawn(async move {
+            discovery_nodes
+                .discover_cluster_live_nodes_from(generation, candidates)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), stalled.notified())
+            .await
+            .expect("cluster discovery never reached the stale candidate");
+        assert!(
+            !discovery.is_finished(),
+            "cluster discovery unexpectedly finished while a candidate was stalled"
+        );
+        assert_eq!(
+            nodes.live_nodes.load().as_ref(),
+            &[stale.clone(), healthy.clone()],
+            "partial publication must add newly validated nodes without dropping last-known-good nodes"
+        );
+
+        release.notify_one();
+        let discovered = tokio::time::timeout(Duration::from_secs(1), discovery)
+            .await
+            .expect("cluster discovery did not finish after releasing the stale candidate")
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(discovered, vec![healthy]);
+    }
+
+    #[tokio::test]
+    async fn older_concurrent_refresh_does_not_overwrite_newer_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = AlternatorConfig::builder()
+            .behavior_version_latest()
+            .scheme("http")
+            .port(port)
+            .seed_hosts(["127.0.0.1"])
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        let first_nodes = nodes.clone();
+        let first_update = tokio::spawn(async move { first_nodes.update_live_nodes().await });
+        let (mut first_request, _) =
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("first refresh did not connect")
+                .unwrap();
+        let mut buffer = [0; 1024];
+        assert!(first_request.read(&mut buffer).await.unwrap() > 0);
+
+        let second_nodes = nodes.clone();
+        let second_update = tokio::spawn(async move { second_nodes.update_live_nodes().await });
+        let (mut second_request, _) =
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("newer refresh did not overlap the stalled pass")
+                .unwrap();
+        assert!(second_request.read(&mut buffer).await.unwrap() > 0);
+
+        let newer_body = r#"["127.0.0.2"]"#;
+        let newer_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            newer_body.len(),
+            newer_body
+        );
+        second_request
+            .write_all(newer_response.as_bytes())
+            .await
+            .unwrap();
+        second_update.await.unwrap();
+
+        let older_body = r#"["127.0.0.3"]"#;
+        let older_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            older_body.len(),
+            older_body
+        );
+        first_request
+            .write_all(older_response.as_bytes())
+            .await
+            .unwrap();
+        first_update.await.unwrap();
+
+        let snapshot = nodes.live_nodes.load();
+        let hosts = snapshot
+            .iter()
+            .map(|node| node.host_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hosts,
+            ["127.0.0.2"],
+            "older refresh must not alter the newer completed topology"
+        );
+    }
+
+    #[test]
+    fn newer_refresh_without_a_result_does_not_suppress_older_result() {
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        let older_generation = nodes.begin_refresh();
+        let _newer_generation = nodes.begin_refresh();
+        let older_result = vec![Arc::new(Url::parse("http://127.0.0.2:1/").unwrap())];
+
+        nodes.publish_live_nodes(older_generation, older_result.clone());
+
+        assert_eq!(nodes.live_nodes.load().as_ref(), &older_result);
     }
 
     #[tokio::test]

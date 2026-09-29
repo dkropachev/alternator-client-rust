@@ -42,7 +42,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
-const ALTERNATOR_ADDRESS: &str = "localhost:8000";
+const DEFAULT_ALTERNATOR_ADDRESS: &str = "localhost:8000";
+
+fn alternator_address() -> String {
+    std::env::var("ALTERNATOR_TEST_ADDRESS")
+        .unwrap_or_else(|_| DEFAULT_ALTERNATOR_ADDRESS.to_string())
+}
 
 struct Fixture {
     ca_pem: String,
@@ -118,7 +123,7 @@ impl AsyncTestContext for HttpsTestContext {
 
         let proxy: Proxy = Proxy::start_tls(
             "localhost:0".to_string(),
-            ALTERNATOR_ADDRESS.to_string(),
+            alternator_address(),
             on_request,
             None,
             None,

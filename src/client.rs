@@ -16,6 +16,18 @@ use crate::live_nodes::{
     LiveNodesBuildError, ensure_native_roots_are_usable, native_roots_are_usable,
 };
 use crate::*;
+use aws_smithy_runtime_api::{
+    box_error::BoxError,
+    client::{
+        connector_metadata::ConnectorMetadata,
+        http::{HttpClient, HttpConnectorSettings, SharedHttpClient, SharedHttpConnector},
+        identity::{
+            IdentityFuture, ResolveCachedIdentity, SharedIdentityCache, SharedIdentityResolver,
+        },
+        runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
+    },
+};
+use aws_smithy_types::config_bag::ConfigBag;
 
 /// Alternator driver's client
 ///
@@ -62,6 +74,7 @@ pub struct AlternatorClientBuildError {
 
 #[derive(Debug)]
 enum AlternatorClientBuildErrorKind {
+    SdkConfiguration(String),
     TlsConfiguration(String),
     LiveNodes(LiveNodesBuildError),
 }
@@ -69,6 +82,9 @@ enum AlternatorClientBuildErrorKind {
 impl std::fmt::Display for AlternatorClientBuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
+            AlternatorClientBuildErrorKind::SdkConfiguration(message) => {
+                write!(formatter, "failed to configure AWS SDK client: {message}")
+            }
             AlternatorClientBuildErrorKind::TlsConfiguration(message) => {
                 write!(formatter, "failed to configure SDK TLS: {message}")
             }
@@ -85,6 +101,7 @@ impl std::fmt::Display for AlternatorClientBuildError {
 impl std::error::Error for AlternatorClientBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
+            AlternatorClientBuildErrorKind::SdkConfiguration(_) => None,
             AlternatorClientBuildErrorKind::TlsConfiguration(_) => None,
             AlternatorClientBuildErrorKind::LiveNodes(source) => Some(source),
         }
@@ -96,6 +113,214 @@ impl From<LiveNodesBuildError> for AlternatorClientBuildError {
         Self {
             kind: AlternatorClientBuildErrorKind::LiveNodes(source),
         }
+    }
+}
+
+fn validate_sdk_default_config(
+    stalled_stream_protection_explicitly_unset: bool,
+) -> Result<(), AlternatorClientBuildError> {
+    if stalled_stream_protection_explicitly_unset {
+        return Err(AlternatorClientBuildError {
+            kind: AlternatorClientBuildErrorKind::SdkConfiguration(
+                "The default stalled stream protection config was removed, and no other config was put in its place."
+                    .to_owned(),
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SdkConfigValidation {
+    error: std::sync::Arc<std::sync::OnceLock<String>>,
+    http_client: SharedHttpClient,
+    identity_cache: SharedIdentityCache,
+}
+
+impl SdkConfigValidation {
+    fn restore_base_components(
+        &self,
+        runtime_components: &RuntimeComponentsBuilder,
+    ) -> RuntimeComponentsBuilder {
+        let mut runtime_components = runtime_components.clone();
+        runtime_components.set_http_client(Some(self.http_client.clone()));
+        runtime_components.set_identity_cache(Some(self.identity_cache.clone()));
+        runtime_components
+    }
+
+    fn validate_http_final_config(
+        &self,
+        runtime_components: &RuntimeComponents,
+        config: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        // Validate the original HTTP client while leaving the selected identity
+        // cache behavior intact. The outer SDK validation will validate that
+        // cache once, after this adapter returns.
+        let mut components = runtime_components.to_builder();
+        components.set_http_client(Some(self.http_client.clone()));
+        components.set_identity_cache(Some(UnvalidatedIdentityCache(
+            runtime_components.identity_cache(),
+        )));
+        components.build()?.validate_final_config(config)
+    }
+
+    fn validate_identity_cache_final_config(
+        &self,
+        runtime_components: &RuntimeComponents,
+        config: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        // Symmetrically validate the original cache without revalidating or
+        // replacing a per-operation HTTP-client override.
+        let mut components = runtime_components.to_builder();
+        if let Some(http_client) = runtime_components.http_client() {
+            components.set_http_client(Some(UnvalidatedHttpClient(http_client)));
+        }
+        components.set_identity_cache(Some(self.identity_cache.clone()));
+        components.build()?.validate_final_config(config)
+    }
+
+    fn record_error(&self, error: BoxError) {
+        let _ = self.error.set(error.to_string());
+    }
+}
+
+impl HttpClient for SdkConfigValidation {
+    fn http_connector(
+        &self,
+        settings: &HttpConnectorSettings,
+        runtime_components: &RuntimeComponents,
+    ) -> SharedHttpConnector {
+        self.http_client
+            .http_connector(settings, runtime_components)
+    }
+
+    fn validate_base_client_config(
+        &self,
+        runtime_components: &RuntimeComponentsBuilder,
+        config: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        if let Err(error) = self
+            .restore_base_components(runtime_components)
+            .validate_base_client_config(config)
+        {
+            self.record_error(error);
+        }
+        Ok(())
+    }
+
+    fn validate_final_config(
+        &self,
+        runtime_components: &RuntimeComponents,
+        config: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        self.validate_http_final_config(runtime_components, config)
+    }
+
+    fn connector_metadata(&self) -> Option<ConnectorMetadata> {
+        self.http_client.connector_metadata()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UnvalidatedHttpClient(SharedHttpClient);
+
+impl HttpClient for UnvalidatedHttpClient {
+    fn http_connector(
+        &self,
+        settings: &HttpConnectorSettings,
+        runtime_components: &RuntimeComponents,
+    ) -> SharedHttpConnector {
+        self.0.http_connector(settings, runtime_components)
+    }
+
+    fn connector_metadata(&self) -> Option<ConnectorMetadata> {
+        self.0.connector_metadata()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UnvalidatedIdentityCache(SharedIdentityCache);
+
+impl ResolveCachedIdentity for UnvalidatedIdentityCache {
+    fn resolve_cached_identity<'a>(
+        &'a self,
+        resolver: SharedIdentityResolver,
+        runtime_components: &'a RuntimeComponents,
+        config: &'a ConfigBag,
+    ) -> IdentityFuture<'a> {
+        self.0
+            .resolve_cached_identity(resolver, runtime_components, config)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedIdentityCache(SdkConfigValidation);
+
+impl ResolveCachedIdentity for ValidatedIdentityCache {
+    fn resolve_cached_identity<'a>(
+        &'a self,
+        resolver: SharedIdentityResolver,
+        runtime_components: &'a RuntimeComponents,
+        config: &'a ConfigBag,
+    ) -> IdentityFuture<'a> {
+        self.0
+            .identity_cache
+            .resolve_cached_identity(resolver, runtime_components, config)
+    }
+
+    fn validate_final_config(
+        &self,
+        runtime_components: &RuntimeComponents,
+        config: &ConfigBag,
+    ) -> Result<(), BoxError> {
+        self.0
+            .validate_identity_cache_final_config(runtime_components, config)
+    }
+}
+
+fn try_dynamodb_client_from_conf(
+    config: aws_sdk_dynamodb::Config,
+) -> Result<aws_sdk_dynamodb::Client, AlternatorClientBuildError> {
+    let http_client = config
+        .http_client()
+        .ok_or_else(|| AlternatorClientBuildError {
+            kind: AlternatorClientBuildErrorKind::SdkConfiguration(
+                "no HTTP client was selected".to_owned(),
+            ),
+        })?;
+    let identity_cache = config
+        .identity_cache()
+        .unwrap_or_else(|| aws_smithy_runtime::client::identity::IdentityCache::lazy().build());
+    let validation_error = std::sync::Arc::new(std::sync::OnceLock::new());
+    let validation = SdkConfigValidation {
+        error: validation_error.clone(),
+        http_client,
+        identity_cache,
+    };
+
+    // The SDK's constructor converts validation errors into panics. Let it run
+    // validation against the exact components and config bag it assembled, but
+    // capture the error in an HTTP-client adapter so `try_from_conf` remains
+    // usable with aborting panic hooks and `panic = "abort"`.
+    //
+    // SDK-owned config validators run before the HTTP client. They cannot fail
+    // for configurations exposed here: rt-tokio always supplies sleep, config
+    // construction supplies time, and callers cannot add custom runtime plugins.
+    let mut builder = config.to_builder();
+    builder.set_http_client(Some(SharedHttpClient::new(validation.clone())));
+    // The HTTP adapter validates the original cache together with all other
+    // components. This delegating cache prevents the SDK from validating it a
+    // second time and turning the same error into a panic.
+    builder.set_identity_cache(ValidatedIdentityCache(validation));
+
+    let client = aws_sdk_dynamodb::Client::from_conf(builder.build());
+    let error = validation_error.get().cloned();
+    match error {
+        Some(message) => Err(AlternatorClientBuildError {
+            kind: AlternatorClientBuildErrorKind::SdkConfiguration(message),
+        }),
+        None => Ok(client),
     }
 }
 
@@ -152,15 +377,17 @@ impl AlternatorClient {
     /// Tries to construct a client after validating required SDK and routing
     /// configuration.
     pub fn try_from_conf(config: AlternatorConfig) -> Result<Self, AlternatorClientBuildError> {
-        // The SDK's behavior-version-latest feature supplies this default
-        // during client construction. Mirror it here for transport selection,
-        // while preserving any explicitly configured older version.
+        // Default this client internally without enabling the SDK's
+        // dependency-wide behavior-version-latest feature. That feature would
+        // also change direct SDK clients in downstream applications.
         let behavior_version = config
             .behavior_version()
             .unwrap_or_else(aws_sdk_dynamodb::config::BehaviorVersion::latest);
 
         let dynamodb_config = config.dynamodb_config.clone();
         let extensions = config.alternator_ext.clone();
+        let stalled_stream_protection_explicitly_unset =
+            extensions.stalled_stream_protection_explicitly_unset;
 
         let request_compression = extensions
             .request_compression
@@ -172,6 +399,7 @@ impl AlternatorClient {
         let has_region = dynamodb_config.region().is_some();
 
         let mut builder = dynamodb_config.to_builder();
+        builder.set_behavior_version(Some(behavior_version));
 
         if !has_credentials_provider && !config.requires_auth() && !config.allows_no_auth() {
             builder = builder.allow_no_auth();
@@ -220,11 +448,6 @@ impl AlternatorClient {
         }
 
         if !has_custom_http_client {
-            // The SDK only selects its modern default connector for v2026 and
-            // newer behavior versions. Supply that connector explicitly for
-            // older versions instead of re-enabling the legacy Hyper stack.
-            let needs_pre_2026_transport = !behavior_version
-                .is_at_least(aws_sdk_dynamodb::config::BehaviorVersion::v2026_01_12());
             // A TLS-capable connector eagerly validates native roots even for
             // an HTTP endpoint, so use an HTTP-only connector when no roots
             // are available.
@@ -234,12 +457,14 @@ impl AlternatorClient {
                     .map(|nodes| nodes.has_usable_native_roots())
                     .unwrap_or_else(native_roots_are_usable);
 
-            if needs_pre_2026_transport || needs_rootless_plaintext_transport {
-                builder.set_http_client(Some(sdk_http_client(
-                    behavior_version,
-                    !needs_rootless_plaintext_transport,
-                )));
-            }
+            // Select the SDK's modern connector explicitly for every behavior
+            // version. Besides supplying it for pre-2026 versions, this gives
+            // the fallible constructor a component through which it can run
+            // the SDK's complete validation without relying on a panic.
+            builder.set_http_client(Some(sdk_http_client(
+                behavior_version,
+                !needs_rootless_plaintext_transport,
+            )));
         }
 
         if !has_region {
@@ -247,6 +472,8 @@ impl AlternatorClient {
                 "us-east-1",
             )));
         }
+
+        validate_sdk_default_config(stalled_stream_protection_explicitly_unset)?;
 
         let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> = match (
             live_nodes.as_ref(),
@@ -262,12 +489,12 @@ impl AlternatorClient {
                 // cycle: main client -> affinity interceptor -> resolver -> DescribeTable
                 // -> main client. Build a separate discovery client from the same base config
                 // but with round-robin routing only..
-                let pk_discovery_client = aws_sdk_dynamodb::Client::from_conf(
+                let pk_discovery_client = try_dynamodb_client_from_conf(
                     builder
                         .clone()
                         .interceptor(RoundRobinQueryPlanInterceptor::new(nodes.clone()))
                         .build(),
-                );
+                )?;
                 let resolver =
                     std::sync::Arc::new(keyrouting::resolver::PartitionKeyResolver::new(
                         pk_discovery_client,
@@ -285,7 +512,7 @@ impl AlternatorClient {
 
         let dynamodb_config = builder.build();
 
-        let dynamodb_client = aws_sdk_dynamodb::Client::from_conf(dynamodb_config);
+        let dynamodb_client = try_dynamodb_client_from_conf(dynamodb_config)?;
 
         if let Some(nodes) = live_nodes {
             nodes.ensure_discovery_started();
@@ -688,7 +915,203 @@ mod tests {
 
     use super::*;
     use aws_sdk_dynamodb::config::Intercept;
+    use aws_smithy_runtime_api::{
+        box_error::BoxError,
+        client::{
+            http::{
+                HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
+                SharedHttpClient, SharedHttpConnector,
+            },
+            orchestrator::HttpRequest,
+            runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
+        },
+    };
+    use aws_smithy_types::config_bag::ConfigBag;
     use itertools::Itertools;
+
+    fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+        let mut messages = vec![error.to_string()];
+        let mut source = error.source();
+        while let Some(error) = source {
+            messages.push(error.to_string());
+            source = error.source();
+        }
+        messages.join(": ")
+    }
+
+    #[derive(Debug)]
+    struct InvalidHttpClient;
+
+    impl HttpClient for InvalidHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            unreachable!("an invalid HTTP client must not be used")
+        }
+
+        fn validate_base_client_config(
+            &self,
+            _: &RuntimeComponentsBuilder,
+            _: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            Err(std::io::Error::other("invalid test HTTP client configuration").into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct SingleValidationHttpClient(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl HttpClient for SingleValidationHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            unreachable!("the validation-only client must not send requests")
+        }
+
+        fn validate_base_client_config(
+            &self,
+            _: &RuntimeComponentsBuilder,
+            _: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::other("HTTP client was validated twice").into()),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct InvalidIdentityCache;
+
+    impl ResolveCachedIdentity for InvalidIdentityCache {
+        fn resolve_cached_identity<'a>(
+            &'a self,
+            _: SharedIdentityResolver,
+            _: &'a RuntimeComponents,
+            _: &'a ConfigBag,
+        ) -> IdentityFuture<'a> {
+            unreachable!("an invalid identity cache must not be used")
+        }
+
+        fn validate_base_client_config(
+            &self,
+            _: &RuntimeComponentsBuilder,
+            _: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            Err(std::io::Error::other("invalid test identity cache configuration").into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FinalValidationIdentityCache(&'static str);
+
+    impl ResolveCachedIdentity for FinalValidationIdentityCache {
+        fn resolve_cached_identity<'a>(
+            &'a self,
+            _: SharedIdentityResolver,
+            _: &'a RuntimeComponents,
+            _: &'a ConfigBag,
+        ) -> IdentityFuture<'a> {
+            unreachable!("final validation must fail before identity resolution")
+        }
+
+        fn validate_final_config(
+            &self,
+            _: &RuntimeComponents,
+            _: &ConfigBag,
+        ) -> Result<(), BoxError> {
+            Err(std::io::Error::other(self.0).into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RuntimeComponentsHttpClient(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl HttpClient for RuntimeComponentsHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            runtime_components: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            self.0.store(
+                runtime_components as *const RuntimeComponents as usize,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            SharedHttpConnector::new(UnusedHttpConnector)
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnusedHttpConnector;
+
+    impl HttpConnector for UnusedHttpConnector {
+        fn call(&self, _: HttpRequest) -> HttpConnectorFuture {
+            unreachable!("the adapter delegation test does not send a request")
+        }
+    }
+
+    #[derive(Debug)]
+    struct RuntimeComponentsIdentityCache(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ResolveCachedIdentity for RuntimeComponentsIdentityCache {
+        fn resolve_cached_identity<'a>(
+            &'a self,
+            _: SharedIdentityResolver,
+            runtime_components: &'a RuntimeComponents,
+            _: &'a ConfigBag,
+        ) -> IdentityFuture<'a> {
+            self.0.store(
+                runtime_components as *const RuntimeComponents as usize,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            IdentityFuture::ready(Err(std::io::Error::other("test identity stop").into()))
+        }
+    }
+
+    #[test]
+    fn validation_adapters_reuse_components_in_runtime_delegates() {
+        let http_components = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let identity_components = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let validation = SdkConfigValidation {
+            error: Default::default(),
+            http_client: SharedHttpClient::new(RuntimeComponentsHttpClient(
+                http_components.clone(),
+            )),
+            identity_cache: SharedIdentityCache::new(RuntimeComponentsIdentityCache(
+                identity_components.clone(),
+            )),
+        };
+        let runtime_components_builder = RuntimeComponentsBuilder::for_tests();
+        let identity_resolver = runtime_components_builder
+            .identity_resolver(&aws_smithy_runtime_api::client::auth::AuthSchemeId::new(
+                "fake",
+            ))
+            .unwrap();
+        let runtime_components = runtime_components_builder.build().unwrap();
+        let expected = &runtime_components as *const RuntimeComponents as usize;
+
+        let _connector = validation.http_connector(
+            &HttpConnectorSettings::builder().build(),
+            &runtime_components,
+        );
+        let config = ConfigBag::base();
+        let identity_cache = ValidatedIdentityCache(validation);
+        let _identity =
+            identity_cache.resolve_cached_identity(identity_resolver, &runtime_components, &config);
+
+        assert_eq!(
+            http_components.load(std::sync::atomic::Ordering::SeqCst),
+            expected
+        );
+        assert_eq!(
+            identity_components.load(std::sync::atomic::Ordering::SeqCst),
+            expected
+        );
+    }
 
     #[test]
     fn test_client_adds_hooks_to_inner_client() {
@@ -734,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn try_from_conf_honors_sdk_behavior_version_default() {
+    fn try_from_conf_sets_its_behavior_version_default_internally() {
         let client = AlternatorClient::try_from_conf(
             AlternatorConfig::builder()
                 .endpoint_url("http://127.0.0.1:8000")
@@ -743,6 +1166,183 @@ mod tests {
         );
 
         assert!(client.is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "A behavior major version must be set")]
+    fn dependency_does_not_default_behavior_version_for_direct_sdk_clients() {
+        let _ = aws_sdk_dynamodb::Client::from_conf(aws_sdk_dynamodb::Config::builder().build());
+    }
+
+    #[test]
+    fn try_from_conf_returns_sdk_validation_errors() {
+        for affinity in [
+            None,
+            Some(crate::keyrouting::KeyRouteAffinityType::AnyWrite),
+        ] {
+            let mut builder = AlternatorConfig::builder()
+                .behavior_version_latest()
+                .scheme("http")
+                .port(8000)
+                .seed_hosts(["127.0.0.1"])
+                .http_client(InvalidHttpClient);
+            if let Some(affinity) = affinity {
+                builder.set_key_route_affinity(affinity);
+            }
+
+            let error = AlternatorClient::try_from_conf(builder.build()).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to configure AWS SDK client: invalid test HTTP client configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_conf_returns_identity_cache_validation_errors() {
+        let error = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
+                .identity_cache(InvalidIdentityCache)
+                .build(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to configure AWS SDK client: invalid test identity cache configuration"
+        );
+    }
+
+    #[test]
+    fn try_from_conf_does_not_trigger_panic_hook_for_sdk_validation_errors() {
+        const CHILD_ENV: &str = "ALTERNATOR_TEST_ABORT_ON_SDK_VALIDATION_PANIC";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            std::panic::set_hook(Box::new(|panic_info| {
+                eprintln!("unexpected panic during fallible construction: {panic_info}");
+                std::process::abort();
+            }));
+
+            let base_builder = || {
+                AlternatorConfig::builder()
+                    .behavior_version_latest()
+                    .endpoint_url("http://127.0.0.1:8000")
+                    .seed_hosts(Vec::<String>::new())
+            };
+            let mut stalled_stream_config_unset = base_builder();
+            stalled_stream_config_unset.set_stalled_stream_protection(None);
+            let error =
+                AlternatorClient::try_from_conf(stalled_stream_config_unset.build()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("The default stalled stream protection config was removed"),
+                "unexpected SDK config error: {error}"
+            );
+
+            let error = AlternatorClient::try_from_conf(
+                AlternatorConfig::builder()
+                    .behavior_version_latest()
+                    .endpoint_url("http://127.0.0.1:8000")
+                    .http_client(InvalidHttpClient)
+                    .build(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "failed to configure AWS SDK client: invalid test HTTP client configuration"
+            );
+
+            let validation_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = AlternatorClient::try_from_conf(
+                AlternatorConfig::builder()
+                    .behavior_version_latest()
+                    .endpoint_url("http://127.0.0.1:8000")
+                    .seed_hosts(Vec::<String>::new())
+                    .http_client(SingleValidationHttpClient(validation_count.clone()))
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                validation_count.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            drop(client);
+
+            let mut restored_sdk_defaults = base_builder();
+            // These SDK setters intentionally treat None as a no-op.
+            restored_sdk_defaults.set_retry_config(None);
+            restored_sdk_defaults.set_timeout_config(None);
+            restored_sdk_defaults.set_stalled_stream_protection(None);
+            restored_sdk_defaults.set_stalled_stream_protection(Some(
+                aws_sdk_dynamodb::config::StalledStreamProtectionConfig::disabled(),
+            ));
+            AlternatorClient::try_from_conf(restored_sdk_defaults.build()).unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::tests::try_from_conf_does_not_trigger_panic_hook_for_sdk_validation_errors",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child process failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_adapters_preserve_per_operation_component_overrides() {
+        let client = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .behavior_version_latest()
+                .endpoint_url("http://127.0.0.1:8000")
+                .seed_hosts(Vec::<String>::new())
+                .identity_cache(FinalValidationIdentityCache("base identity cache used"))
+                .build(),
+        )
+        .unwrap();
+
+        let identity_override_error = client
+            .list_tables()
+            .customize()
+            .config_override(aws_sdk_dynamodb::Config::builder().identity_cache(
+                FinalValidationIdentityCache("operation identity cache used"),
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        let identity_override_error = error_chain(&identity_override_error);
+        assert!(
+            identity_override_error.contains("operation identity cache used"),
+            "unexpected operation error: {identity_override_error}"
+        );
+        assert!(!identity_override_error.contains("base identity cache used"));
+
+        let http_override_error = client
+            .list_tables()
+            .customize()
+            .config_override(
+                aws_sdk_dynamodb::Config::builder()
+                    .http_client(aws_smithy_http_client::Builder::new().build_http()),
+            )
+            .send()
+            .await
+            .unwrap_err();
+        let http_override_error = error_chain(&http_override_error);
+        assert!(
+            http_override_error.contains("base identity cache used"),
+            "unexpected operation error: {http_override_error}"
+        );
     }
 
     #[test]
