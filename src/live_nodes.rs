@@ -103,7 +103,7 @@ use crate::routing_scope::RoutingScope;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use futures_util::FutureExt;
 use rand::seq::SliceRandom;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -261,7 +261,7 @@ pub struct LiveNodes {
     native_roots_usable: bool,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
-    bg_task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    discovery_tasks: Mutex<DiscoveryTaskState>,
     discovery_runtime: ArcSwapOption<DiscoveryRuntime>,
 }
 
@@ -279,9 +279,9 @@ const SHUTDOWN_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 struct DiscoveryRuntime {
     id: tokio::runtime::Id,
     handle: Handle,
-    /// Once this registration needs handoff, it must never become the active
-    /// owner again even if its runtime later recovers from blocking-pool
-    /// saturation.
+    /// A timed-out probe makes this registration eligible for handoff. If its
+    /// pool recovers before a replacement takes over, the registration can be
+    /// retained without queuing a second unresolved probe.
     handoff_required: AtomicBool,
     shutdown_probe: Mutex<ShutdownProbe>,
 }
@@ -290,6 +290,25 @@ struct DiscoveryRuntime {
 struct ShutdownProbe {
     last_started: Option<Instant>,
     pending: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryTaskState {
+    active_task: Option<tokio::task::AbortHandle>,
+    /// Probes that outlived their ownership registration. Keeping their join
+    /// handles lets us prevent the same runtime from queuing another probe
+    /// until the blocking pool has removed the original one.
+    retired_probes: HashMap<tokio::runtime::Id, tokio::task::JoinHandle<()>>,
+}
+
+impl DiscoveryTaskState {
+    fn retire_probe(&mut self, runtime_id: tokio::runtime::Id, probe: tokio::task::JoinHandle<()>) {
+        let previous = self.retired_probes.insert(runtime_id, probe);
+        assert!(
+            previous.is_none(),
+            "a runtime must not own more than one unresolved discovery probe"
+        );
+    }
 }
 
 impl ShutdownProbe {
@@ -306,12 +325,17 @@ struct RefreshState {
 }
 
 impl DiscoveryRuntime {
+    #[cfg(test)]
     fn new(id: tokio::runtime::Id, handle: Handle) -> Self {
+        Self::with_probe(id, handle, ShutdownProbe::default())
+    }
+
+    fn with_probe(id: tokio::runtime::Id, handle: Handle, shutdown_probe: ShutdownProbe) -> Self {
         Self {
             id,
             handle,
             handoff_required: AtomicBool::new(false),
-            shutdown_probe: Mutex::new(ShutdownProbe::default()),
+            shutdown_probe: Mutex::new(shutdown_probe),
         }
     }
 
@@ -320,17 +344,11 @@ impl DiscoveryRuntime {
     }
 
     fn should_handoff_at(&self, now: Instant) -> bool {
-        if self.handoff_required.load(Ordering::Acquire) {
-            return true;
-        }
-
         let mut probe_state = self
             .shutdown_probe
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if self.handoff_required.load(Ordering::Acquire) {
-            return true;
-        }
+        let mut handoff_required = self.handoff_required.load(Ordering::Acquire);
         if let Some(result) = probe_state
             .pending
             .as_mut()
@@ -341,17 +359,33 @@ impl DiscoveryRuntime {
                 self.handoff_required.store(true, Ordering::Release);
                 return true;
             }
+
+            // The pool recovered before an eligible replacement took over.
+            // Keep the current owner and permit a later bounded probe so a
+            // subsequent shutdown can still be distinguished from saturation.
+            if handoff_required {
+                self.handoff_required.store(false, Ordering::Release);
+                handoff_required = false;
+            }
         } else if probe_state.pending.is_some() {
+            if handoff_required {
+                return true;
+            }
             if !probe_state.is_due(now) {
                 return false;
             }
 
             // A pre-shutdown probe can remain queued forever behind a blocking
-            // task. Replacing it every interval would grow Tokio's blocking
-            // queue without bound, so one stale probe instead makes this
-            // registration ineligible and lets a caller runtime take over.
-            probe_state.pending.take().unwrap().abort();
+            // task. Keep it attached to this registration: ownership transfer
+            // moves it into LiveNodes' retired-probe set so this runtime cannot
+            // enqueue another probe until the blocking pool removes this one.
             self.handoff_required.store(true, Ordering::Release);
+            return true;
+        }
+
+        // A transfer may already have detached the timed-out probe while this
+        // registration is still visible through ArcSwap.
+        if handoff_required {
             return true;
         }
 
@@ -378,6 +412,14 @@ impl DiscoveryRuntime {
         }
 
         shutdown
+    }
+
+    fn take_pending_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.shutdown_probe
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
+            .take()
     }
 }
 
@@ -487,7 +529,7 @@ impl LiveNodes {
             native_roots_usable,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             notify: Arc::new(tokio::sync::Notify::new()),
-            bg_task: std::sync::Mutex::new(None),
+            discovery_tasks: Mutex::new(DiscoveryTaskState::default()),
             discovery_runtime: ArcSwapOption::empty(),
         })))
     }
@@ -636,23 +678,52 @@ impl LiveNodes {
             return;
         }
 
-        let mut bg_task = self.bg_task.lock().unwrap_or_else(|err| err.into_inner());
+        let mut discovery_tasks = self
+            .discovery_tasks
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         // Another caller may have completed the cold start or transfer while
         // this caller waited for the mutex.
-        if self
-            .discovery_runtime
-            .load()
+        let active_runtime = self.discovery_runtime.load_full();
+        if active_runtime
             .as_ref()
             .is_some_and(|active| active.id == runtime_id || !active.should_handoff())
         {
             return;
         }
 
-        if let Some(old_task) = bg_task.take() {
+        // Aborting a timed-out probe would not remove it from Tokio's blocking
+        // queue. Reattach this runtime's retained probe on takeover instead of
+        // enqueueing another one.
+        discovery_tasks
+            .retired_probes
+            .retain(|_, probe| !probe.is_finished());
+        let retained_probe = discovery_tasks.retired_probes.remove(&runtime_id);
+
+        if let Some(active_runtime) = active_runtime
+            && let Some(probe) = active_runtime.take_pending_probe()
+        {
+            discovery_tasks.retire_probe(active_runtime.id, probe);
+        }
+
+        if let Some(old_task) = discovery_tasks.active_task.take() {
             old_task.abort();
         }
 
-        let runtime = Arc::new(DiscoveryRuntime::new(runtime_id, handle.clone()));
+        // If no serviceable owner remains, restart immediately even when this
+        // runtime has an unresolved retired probe. Reattach it to the new
+        // registration so the one-probe bound is preserved without leaving
+        // discovery stopped.
+        let shutdown_probe =
+            retained_probe.map_or_else(ShutdownProbe::default, |pending| ShutdownProbe {
+                last_started: Some(Instant::now()),
+                pending: Some(pending),
+            });
+        let runtime = Arc::new(DiscoveryRuntime::with_probe(
+            runtime_id,
+            handle.clone(),
+            shutdown_probe,
+        ));
         self.discovery_runtime.store(Some(runtime.clone()));
         let weak_self = Arc::downgrade(self);
         let notify = self.notify.clone();
@@ -690,7 +761,7 @@ impl LiveNodes {
                 }
             }
         });
-        *bg_task = Some(task.abort_handle());
+        discovery_tasks.active_task = Some(task.abort_handle());
     }
 
     fn mark_activity(&self) {
@@ -844,8 +915,8 @@ fn node_is_in_list(node: &Url, nodes: &[Arc<Url>]) -> bool {
 
 impl Drop for LiveNodes {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.bg_task.lock()
-            && let Some(task) = guard.take()
+        if let Ok(mut state) = self.discovery_tasks.lock()
+            && let Some(task) = state.active_task.take()
         {
             task.abort();
         }
@@ -859,6 +930,35 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    struct BlockingPoolBlockers(Vec<Option<std::sync::mpsc::SyncSender<()>>>);
+
+    impl Drop for BlockingPoolBlockers {
+        fn drop(&mut self) {
+            for release in &mut self.0 {
+                if let Some(release) = release.take() {
+                    let _ = release.send(());
+                }
+            }
+        }
+    }
+
+    fn saturate_blocking_pools(runtimes: &[&tokio::runtime::Runtime]) -> BlockingPoolBlockers {
+        let mut releases = Vec::with_capacity(runtimes.len());
+        for runtime in runtimes {
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            runtime.spawn_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            started_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("blocking pool was not saturated");
+            releases.push(Some(release_tx));
+        }
+        BlockingPoolBlockers(releases)
+    }
 
     fn discovery_is_running(nodes: &LiveNodes) -> bool {
         nodes.discovery_runtime.load().is_some()
@@ -1195,6 +1295,335 @@ mod tests {
         blocker_done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("blocking task did not finish");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                discovery_runtime.should_handoff_at(started + SHUTDOWN_PROBE_INTERVAL),
+                "a timed-out registration must remain eligible for handoff"
+            );
+            if discovery_runtime
+                .shutdown_probe
+                .lock()
+                .unwrap()
+                .pending
+                .is_none()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shutdown probe did not finish after the blocking pool recovered"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn saturated_runtimes_reuse_probes_across_discovery_handoffs() {
+        let first_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let second_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Release the blockers before dropping either runtime, including while
+        // unwinding from a failed assertion.
+        let _blocking_pools = saturate_blocking_pools(&[&first_runtime, &second_runtime]);
+
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let first_owner = nodes.discovery_runtime.load_full().unwrap();
+
+        // Queue a probe on the first runtime, make it stale without sleeping,
+        // and hand discovery to the second runtime.
+        second_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let (first_probe_started, first_probe_id) = {
+            let probe = first_owner.shutdown_probe.lock().unwrap();
+            (
+                probe
+                    .last_started
+                    .expect("first runtime should have a queued probe"),
+                probe.pending.as_ref().unwrap().id(),
+            )
+        };
+        assert!(first_owner.should_handoff_at(first_probe_started + SHUTDOWN_PROBE_INTERVAL));
+        second_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let second_owner = nodes.discovery_runtime.load_full().unwrap();
+        assert_eq!(second_owner.id, second_runtime.handle().id());
+        assert_eq!(
+            nodes
+                .discovery_tasks
+                .lock()
+                .unwrap()
+                .retired_probes
+                .get(&first_runtime.handle().id())
+                .expect("first runtime's probe should remain tracked")
+                .id(),
+            first_probe_id
+        );
+
+        // Queue and age a probe on the second runtime too. The first runtime
+        // can take discovery back by reattaching its retained probe while the
+        // second runtime's probe becomes the sole retired probe.
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let (second_probe_started, second_probe_id) = {
+            let probe = second_owner.shutdown_probe.lock().unwrap();
+            (
+                probe
+                    .last_started
+                    .expect("second runtime should have a queued probe"),
+                probe.pending.as_ref().unwrap().id(),
+            )
+        };
+        assert!(second_owner.should_handoff_at(second_probe_started + SHUTDOWN_PROBE_INTERVAL));
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+
+        let first_owner_again = nodes.discovery_runtime.load_full().unwrap();
+        assert_eq!(first_owner_again.id, first_runtime.handle().id());
+        assert_eq!(
+            first_owner_again
+                .shutdown_probe
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .expect("first runtime's retained probe should be reattached")
+                .id(),
+            first_probe_id
+        );
+        {
+            let tasks = nodes.discovery_tasks.lock().unwrap();
+            assert_eq!(tasks.retired_probes.len(), 1);
+            assert_eq!(
+                tasks
+                    .retired_probes
+                    .get(&second_runtime.handle().id())
+                    .expect("second runtime's probe should become retired")
+                    .id(),
+                second_probe_id
+            );
+        }
+
+        // A further handoff reuses the second runtime's retained probe and
+        // retires the first runtime's original probe again. No new blocking
+        // probe is added for either runtime.
+        let first_probe_started = first_owner_again
+            .shutdown_probe
+            .lock()
+            .unwrap()
+            .last_started
+            .expect("reattached probe should retain liveness timing");
+        assert!(first_owner_again.should_handoff_at(first_probe_started + SHUTDOWN_PROBE_INTERVAL));
+        second_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let second_owner_again = nodes.discovery_runtime.load_full().unwrap();
+        assert_eq!(second_owner_again.id, second_runtime.handle().id());
+        assert_eq!(
+            second_owner_again
+                .shutdown_probe
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .expect("second runtime's retained probe should be reattached")
+                .id(),
+            second_probe_id
+        );
+        let tasks = nodes.discovery_tasks.lock().unwrap();
+        assert_eq!(tasks.retired_probes.len(), 1);
+        assert_eq!(
+            tasks
+                .retired_probes
+                .get(&first_runtime.handle().id())
+                .expect("first runtime's probe should become retired again")
+                .id(),
+            first_probe_id
+        );
+    }
+
+    #[test]
+    fn ownerless_discovery_reuses_an_unfinished_retired_probe() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _blocking_pool = saturate_blocking_pools(&[&runtime]);
+
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        let runtime_id = runtime.handle().id();
+        let pending = runtime.handle().spawn_blocking(|| ());
+        let probe_id = pending.id();
+        nodes
+            .discovery_tasks
+            .lock()
+            .unwrap()
+            .retire_probe(runtime_id, pending);
+        assert!(nodes.discovery_runtime.load().is_none());
+
+        runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+
+        let owner = nodes.discovery_runtime.load_full().unwrap();
+        assert_eq!(owner.id, runtime_id);
+        assert_eq!(
+            owner
+                .shutdown_probe
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .expect("the unresolved retired probe should be reused")
+                .id(),
+            probe_id
+        );
+        assert!(
+            nodes
+                .discovery_tasks
+                .lock()
+                .unwrap()
+                .retired_probes
+                .is_empty(),
+            "the reused probe must no longer be tracked as retired"
+        );
+    }
+
+    #[test]
+    fn retained_probe_runtime_replaces_shutdown_saturated_owner() {
+        let first_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let second_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _blocking_pools = saturate_blocking_pools(&[&first_runtime, &second_runtime]);
+
+        let nodes = LiveNodes::new(&test_config()).unwrap();
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let first_owner = nodes.discovery_runtime.load_full().unwrap();
+
+        // Hand discovery from A to B while A's blocking pool keeps its probe
+        // queued. This leaves that exact probe retained for A.
+        second_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let (first_probe_started, first_probe_id) = {
+            let probe = first_owner.shutdown_probe.lock().unwrap();
+            (
+                probe
+                    .last_started
+                    .expect("first runtime should have a queued probe"),
+                probe.pending.as_ref().unwrap().id(),
+            )
+        };
+        assert!(first_owner.should_handoff_at(first_probe_started + SHUTDOWN_PROBE_INTERVAL));
+        second_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let second_owner = nodes.discovery_runtime.load_full().unwrap();
+        assert_eq!(second_owner.id, second_runtime.handle().id());
+
+        // Queue and age B's probe before occupying its only async worker. Once
+        // shutdown starts, neither B's task guard nor its blocking probe can
+        // update discovery ownership.
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+        let (second_probe_started, second_probe_id) = {
+            let probe = second_owner.shutdown_probe.lock().unwrap();
+            (
+                probe
+                    .last_started
+                    .expect("second runtime should have a queued probe"),
+                probe.pending.as_ref().unwrap().id(),
+            )
+        };
+        assert!(second_owner.should_handoff_at(second_probe_started + SHUTDOWN_PROBE_INTERVAL));
+
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        second_runtime.spawn(async move {
+            worker_started_tx.send(()).unwrap();
+            let _ = release_worker_rx.recv();
+        });
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second runtime worker was not saturated");
+        second_runtime.shutdown_background();
+        assert!(Arc::ptr_eq(
+            &nodes.discovery_runtime.load_full().unwrap(),
+            &second_owner
+        ));
+        assert!(
+            second_owner
+                .shutdown_probe
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .is_some_and(|probe| !probe.is_finished()),
+            "the saturated owner's probe must remain pending before takeover"
+        );
+
+        // One request-side check by A must transfer ownership immediately,
+        // reusing A's retained probe and retiring B's pending probe.
+        first_runtime.block_on(async {
+            nodes.ensure_discovery_started();
+        });
+
+        let owner = nodes.discovery_runtime.load_full().unwrap();
+        assert_eq!(owner.id, first_runtime.handle().id());
+        assert_eq!(
+            owner
+                .shutdown_probe
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .expect("first runtime's retained probe should be reused")
+                .id(),
+            first_probe_id
+        );
+        let tasks = nodes.discovery_tasks.lock().unwrap();
+        assert_eq!(tasks.retired_probes.len(), 1);
+        assert_eq!(
+            tasks
+                .retired_probes
+                .get(&second_owner.id)
+                .expect("second runtime's pending probe should be retired")
+                .id(),
+            second_probe_id
+        );
+        drop(tasks);
+        drop(release_worker_tx);
     }
 
     #[test]
