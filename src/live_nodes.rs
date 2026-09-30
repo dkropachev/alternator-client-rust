@@ -135,7 +135,7 @@ impl std::fmt::Display for LiveNodesBuildError {
             }
             Self::InvalidScheme(scheme) => write!(
                 formatter,
-                "invalid Alternator transport scheme {scheme:?}: expected http or https"
+                "invalid Alternator transport scheme {scheme:?}: expected http or https, or a valid custom URI scheme for direct routing with a custom HTTP client"
             ),
             Self::TlsConfiguration(message) => {
                 write!(formatter, "failed to configure discovery TLS: {message}")
@@ -484,7 +484,7 @@ impl LiveNodes {
             // Requests go to the seed host itself, so it has to be a usable
             // target even though nothing is discovered through it. A custom
             // HTTP client may speak a scheme this driver does not know.
-            if !is_bare_scheme(&alternator_scheme)
+            if !is_valid_uri_scheme(&alternator_scheme)
                 || (config.http_client().is_none()
                     && !alternator_scheme.eq_ignore_ascii_case("http")
                     && !alternator_scheme.eq_ignore_ascii_case("https"))
@@ -903,18 +903,21 @@ pub(crate) fn build_seed_url(
     build_node_url(scheme, unbracketed, port)
 }
 
-/// Whether `scheme` can only ever become the scheme of a URL built from it.
+/// Whether `scheme` is a syntactically valid bare URI scheme.
 ///
-/// [`build_node_url`] formats it into `{scheme}://{authority}`, so a scheme
-/// carrying ':' or '/' would supply the authority itself. Scheme normalization
-/// in `set_scheme` strips the trailing ':' and '/' of legitimate input, so
-/// "http", "http:" and "http://" all pass.
-fn is_bare_scheme(scheme: &str) -> bool {
-    !scheme.is_empty() && !scheme.contains(':') && !scheme.contains('/')
+/// Validate before calling [`Url::parse`]. WHATWG URL parsing strips ASCII
+/// tabs, newlines, carriage returns, and surrounding control characters, so
+/// relying on it alone could silently turn malformed input into another valid
+/// transport scheme.
+fn is_valid_uri_scheme(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 fn build_node_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
-    if !is_bare_scheme(scheme) {
+    if !is_valid_uri_scheme(scheme) {
         return Err(url::ParseError::RelativeUrlWithoutBase);
     }
     let authority = if addr.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -1736,27 +1739,73 @@ mod tests {
     }
 
     #[test]
-    fn custom_http_client_defers_direct_scheme_validation() {
+    fn custom_http_client_supports_valid_direct_schemes() {
+        for (configured, stored, endpoint) in [
+            ("custom", "custom", "custom://host"),
+            ("CUSTOM", "CUSTOM", "custom://host"),
+            ("a+b.c-1", "a+b.c-1", "a+b.c-1://host"),
+            ("custom:", "custom", "custom://host"),
+            ("custom://", "custom", "custom://host"),
+        ] {
+            let config = AlternatorConfig::builder()
+                .scheme(configured)
+                .seed_hosts(["host"])
+                .without_discovery()
+                .http_client(aws_smithy_http_client::Builder::new().build_http())
+                .build();
+
+            assert_eq!(config.scheme().as_deref(), Some(stored));
+            assert_eq!(config.endpoint_url().as_deref(), Some(endpoint));
+            assert!(LiveNodes::try_new(&config).unwrap().is_none());
+            assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
+        }
+    }
+
+    #[test]
+    fn custom_http_client_does_not_allow_malformed_direct_schemes() {
+        for malformed in [
+            "\nhttp",
+            "ht\ntp",
+            "\0http",
+            "http\t",
+            "1custom",
+            "+custom",
+            "éhttp",
+            "http::",
+            "http:/",
+            "http///",
+            "http:://",
+            "https://dynamodb.us-east-1.amazonaws.com/x",
+        ] {
+            let config = AlternatorConfig::builder()
+                .scheme(malformed)
+                .seed_hosts(["host"])
+                .without_discovery()
+                .http_client(aws_smithy_http_client::Builder::new().build_http())
+                .build();
+
+            assert_eq!(config.endpoint_url(), None, "accepted {malformed:?}");
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::InvalidScheme(_))
+            ));
+            assert!(crate::AlternatorClient::try_from_conf(config).is_err());
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_custom_schemes_even_with_a_custom_http_client() {
         let config = AlternatorConfig::builder()
             .scheme("custom")
             .seed_hosts(["host"])
-            .without_discovery()
             .http_client(aws_smithy_http_client::Builder::new().build_http())
             .build();
 
-        assert!(LiveNodes::try_new(&config).unwrap().is_none());
-        assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
-
-        let url_shaped = AlternatorConfig::builder()
-            .scheme("https://dynamodb.us-east-1.amazonaws.com/x")
-            .seed_hosts(["host"])
-            .without_discovery()
-            .http_client(aws_smithy_http_client::Builder::new().build_http())
-            .build();
         assert!(matches!(
-            LiveNodes::try_new(&url_shaped),
-            Err(LiveNodesBuildError::InvalidScheme(_))
+            LiveNodes::try_new(&config),
+            Err(LiveNodesBuildError::InvalidScheme(scheme)) if scheme == "custom"
         ));
+        assert!(crate::AlternatorClient::try_from_conf(config).is_err());
     }
 
     #[test]

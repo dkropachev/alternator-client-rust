@@ -108,7 +108,7 @@ Supported auth modes are:
 - SigV4 with a credentials provider configured through `credentials_provider(...)`
 - SigV4 with per-request credentials, usually with a client built using `require_auth()`
 
-The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, custom endpoint resolvers, or the SDK's `endpoint_url(...)`. These APIs are intentionally absent rather than accepted and ignored. Use the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing; the SDK endpoint follows from them. Use `user_agent(...)` for Alternator client identification.
+The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, custom endpoint resolvers, or an SDK `endpoint_url(...)` builder setter. These APIs are intentionally absent rather than accepted and ignored. Use the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing; the SDK endpoint follows from them. Use `user_agent(...)` for Alternator client identification.
 
 Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, framework metadata, and interceptors remain available as escape hatches. Framework metadata is passed through to the underlying DynamoDB config for SDK integrations, while `user_agent(...)` controls the driver's final Alternator client identification. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
 
@@ -120,7 +120,7 @@ A single Alternator cluster typically consists of multiple nodes, any of which c
 
 ### Seed hosts
 
-Unlike the AWS SDK, this driver has no `endpoint_url`. Requests go to cluster nodes it discovers for itself, so what it takes is *seed hosts*, together with the Alternator scheme and port. The endpoint the AWS SDK is pointed at follows from them, so there is no second setting to keep in step:
+Unlike the AWS SDK configuration builder, `AlternatorBuilder` has no `endpoint_url(...)` setter. Requests go to cluster nodes it discovers for itself, so what it takes is *seed hosts*, together with the Alternator scheme and port. The endpoint the AWS SDK is pointed at follows from them, so there is no second setting to keep in step:
 
 ```rust
 use alternator_driver::AlternatorConfig;
@@ -165,16 +165,19 @@ let config = AlternatorConfig::builder()
 
 In this mode every request goes to that address as it is, with no `/localnodes` discovery and no rewriting. Without a seed host to send them to, building a client fails rather than falling back to an AWS endpoint.
 
-Because seed hosts are the only routing configuration there is, retargeting an existing client at another cluster is a matter of setting them again:
+`AlternatorClient` instances are immutable. To retarget a client at another cluster, copy its configuration into a mutable builder, replace the routing settings, explicitly enable discovery, and construct a new client:
 
 ```rust
+use alternator_driver::AlternatorClient;
+
 // `client` is an existing AlternatorClient.
-let retargeted = client
-    .config()
-    .to_builder()
-    .seed_hosts(["new-cluster"])
-    .port(8043)
-    .build();
+let mut builder = client.config().to_builder();
+builder
+    .set_seed_hosts(vec!["new-cluster".to_owned()])
+    .set_port(8043)
+    .set_without_discovery(false);
+
+let retargeted = AlternatorClient::from_conf(builder.build());
 ```
 
 ### AWS SDK region

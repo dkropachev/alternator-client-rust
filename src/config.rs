@@ -241,7 +241,11 @@ impl AlternatorConfig {
         self.alternator_ext.routing_scope.clone()
     }
 
-    /// Gets the URI scheme (http or https).
+    /// Gets the configured URI scheme.
+    ///
+    /// Discovery and the built-in HTTP client support `http` and `https`.
+    /// Direct routing may use another valid URI scheme when a custom HTTP
+    /// client that supports it is configured.
     pub fn scheme(&self) -> Option<String> {
         self.alternator_ext.scheme.clone()
     }
@@ -626,23 +630,36 @@ impl AlternatorBuilder {
         self
     }
 
-    /// Sets the URI scheme (http or https).
+    /// Sets the URI scheme.
     ///
-    /// Accepts for example "http", "http:", "http://" — stores just "http", same with "https".
-    /// Other values are rejected when constructing an [`AlternatorClient`].
+    /// Accepts a bare URI scheme, optionally followed by `:` or `://`, and
+    /// stores the bare scheme. Discovery and the built-in HTTP client support
+    /// `http` and `https`. With
+    /// [`without_discovery`](Self::without_discovery) and a custom HTTP client,
+    /// any syntactically valid URI scheme is accepted.
+    ///
+    /// Malformed schemes and schemes unsupported by the selected routing and
+    /// HTTP-client configuration are rejected when constructing an
+    /// [`AlternatorClient`].
     pub fn scheme(mut self, scheme: impl Into<String>) -> Self {
         self.set_scheme(scheme);
         self
     }
 
-    /// Sets the URI scheme (http or https).
+    /// Sets the URI scheme.
     ///
-    /// Accepts for example "http", "http:", "http://" — stores just "http", same with "https".
-    /// Other values are rejected when constructing an [`AlternatorClient`].
+    /// See [`AlternatorBuilder::scheme`].
     pub fn set_scheme(&mut self, scheme: impl Into<String>) -> &mut Self {
         let s = scheme.into();
 
-        let normalized = s.trim_end_matches('/').trim_end_matches(':').to_string();
+        // Accept only the two documented wrappers. Repeated or partial
+        // delimiters must remain visible so construction can reject them as a
+        // malformed scheme instead of silently repairing them.
+        let normalized = s
+            .strip_suffix("://")
+            .or_else(|| s.strip_suffix(':'))
+            .unwrap_or(&s)
+            .to_string();
         self.alternator_ext.scheme = Some(normalized);
         self
     }
@@ -698,16 +715,18 @@ impl AlternatorBuilder {
     /// and no `/localnodes` discovery runs. Without a seed host to send them
     /// to, building a client fails rather than routing anywhere unintended.
     pub fn without_discovery(mut self) -> Self {
-        self.set_without_discovery();
+        self.set_without_discovery(true);
         self
     }
 
-    /// Send every request straight to the configured seed host instead of
-    /// discovering live cluster nodes through it.
+    /// Sets whether every request goes straight to the configured seed host.
     ///
-    /// See [`AlternatorBuilder::without_discovery`].
-    pub fn set_without_discovery(&mut self) -> &mut Self {
-        self.alternator_ext.without_discovery = true;
+    /// Passing `true` disables discovery as described by
+    /// [`AlternatorBuilder::without_discovery`]. Passing `false` enables
+    /// discovery again, which is useful when rebuilding a direct-routing
+    /// configuration through [`AlternatorConfig::to_builder`].
+    pub fn set_without_discovery(&mut self, without_discovery: bool) -> &mut Self {
+        self.alternator_ext.without_discovery = without_discovery;
         self
     }
     /// Sets the key route affinity configuration.
@@ -1384,18 +1403,55 @@ mod test {
     }
 
     #[test]
-    fn setting_scheme_test() {
-        let config = AlternatorConfig::builder().scheme("https://").build();
+    fn discovery_can_be_reenabled_when_rebuilding_a_direct_config() {
+        let direct = AlternatorConfig::builder()
+            .seed_hosts(["load-balancer.example.com"])
+            .port(8000)
+            .without_discovery()
+            .build();
 
-        assert_eq!(config.scheme(), Some("https".to_string()));
+        for set_discovery_first in [false, true] {
+            let mut builder = direct.to_builder();
+            if set_discovery_first {
+                builder.set_without_discovery(false);
+            }
+            builder
+                .set_seed_hosts(vec!["node-1".to_string(), "node-2".to_string()])
+                .set_port(9000);
+            if !set_discovery_first {
+                builder.set_without_discovery(false);
+            }
 
-        let config = AlternatorConfig::builder().scheme("http:").build();
+            let discovery = builder.build();
+            assert!(!discovery.without_discovery());
+            assert_eq!(
+                discovery.seed_hosts(),
+                Some(vec!["node-1".to_string(), "node-2".to_string()])
+            );
+            assert!(LiveNodes::try_new(&discovery).unwrap().is_some());
+        }
+    }
 
-        assert_eq!(config.scheme(), Some("http".to_string()));
+    #[test]
+    fn scheme_normalization_accepts_only_documented_wrappers() {
+        for (scheme, expected) in [
+            ("https://", "https"),
+            ("http:", "http"),
+            ("http", "http"),
+            ("custom://", "custom"),
+            ("custom:", "custom"),
+        ] {
+            let config = AlternatorConfig::builder().scheme(scheme).build();
+            assert_eq!(config.scheme().as_deref(), Some(expected));
+        }
 
-        let config = AlternatorConfig::builder().scheme("http").build();
-
-        assert_eq!(config.scheme(), Some("http".to_string()));
+        for malformed in ["http::", "http:/", "http///", "http:://"] {
+            let config = AlternatorConfig::builder()
+                .scheme(malformed)
+                .seed_hosts(["host"])
+                .build();
+            assert_eq!(config.endpoint_url(), None, "accepted {malformed:?}");
+        }
     }
 
     #[test]
