@@ -569,11 +569,13 @@ async fn calls_correct_datacenter_scope_test() {
     let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
     let client = create_client_with_scope(cluster, scope.clone());
 
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &scope),
     )
     .await;
+    request_counter.reset_posts();
     let n = 20;
     make_n_calls(&client, n).await;
 
@@ -601,11 +603,13 @@ async fn calls_correct_rack_scope_test() {
     let scope = scope_utils::rack_scope_from_index(cluster, 1, 1);
     let client = create_client_with_scope(cluster, scope.clone());
 
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &scope),
     )
     .await;
+    request_counter.reset_posts();
     let n = 20;
     make_n_calls(&client, n).await;
 
@@ -637,7 +641,7 @@ async fn calls_correct_cluster_scope_test() {
     );
     let live_node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
 
-    wait_until_live_nodes_match(&client, live_node_ips.clone()).await;
+    wait_until_requests_routed_to(&client, &request_counter, live_node_ips.clone()).await;
 
     request_counter.reset();
     make_n_calls(&client, live_node_ips.len()).await;
@@ -672,29 +676,26 @@ async fn dns_entrypoint_discovers_live_cluster_nodes_test() {
     });
     start_proxies(cluster, proxy_port, &request_counter).await;
 
+    let scope = RoutingScope::from_cluster();
+    let discovered_node_ips = vec![target_ip.as_str()];
     let client = AlternatorClient::from_conf(
         minimal_builder()
             .scheme("http")
             .port(proxy_port)
             .seed_hosts(vec!["localhost".to_string()])
-            .routing_scope(RoutingScope::from_cluster())
+            .routing_scope(scope)
             .build(),
     );
-    let live_nodes = client.config().live_nodes().unwrap().clone();
 
-    live_nodes.update_live_nodes().await;
-
-    let discovered = live_nodes.get_live_nodes();
-    let hosts: Vec<&str> = discovered.iter().filter_map(|url| url.host_str()).collect();
-    assert!(!hosts.is_empty(), "DNS entrypoint should discover nodes");
-    assert!(
-        hosts.iter().all(|host| *host != "localhost"),
-        "DNS entrypoint should be replaced by live cluster node records, got {hosts:?}"
-    );
+    wait_until_requests_routed_to(&client, &request_counter, discovered_node_ips.clone()).await;
 
     request_counter.reset();
-    make_n_calls(&client, hosts.len()).await;
-    assert_round_robin_counts(&request_counter, &hosts, "DNS entrypoint cluster scope");
+    make_n_calls(&client, discovered_node_ips.len()).await;
+    assert_round_robin_counts(
+        &request_counter,
+        &discovered_node_ips,
+        "DNS entrypoint cluster scope",
+    );
 }
 
 #[tokio::test]
@@ -704,27 +705,29 @@ async fn node_shut_down_test() {
     let cluster = &mut *guard;
 
     let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
-    let redirect_node = redirect_target_node(cluster);
+    let request_counter = RequestCounter::from_cluster(cluster);
+    start_redirecting_proxies(cluster, PROXY_PORT, &request_counter).await;
 
     let client = create_client_with_scope(cluster, scope.clone());
 
-    // This counter holds all nodes that were shut down, sum of its counters should always be 0.
-    let mut request_counter = RequestCounter::new();
     loop {
-        let ips_owned: Vec<String> = scope_utils::working_nodes_ips_in_scope(cluster, &scope)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        let Some(node) = scope_utils::scope_first_working_node_mut(cluster, &scope) else {
+        let working_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
+        if working_ips.is_empty() {
             break;
-        };
-        let ips: Vec<&str> = ips_owned.iter().map(String::as_str).collect();
-        wait_until_live_nodes_match(&client, ips).await;
+        }
+
+        wait_until_requests_routed_to(&client, &request_counter, working_ips.clone()).await;
+
+        request_counter.reset_posts();
         make_n_calls(&client, 10).await;
-        assert_eq!(request_counter.total_posts(), 0);
+        assert_eq!(
+            request_counter.get_posts_to_other_ips(&working_ips),
+            0,
+            "requests still reached an out-of-scope or stopped node; counters: {request_counter:?}"
+        );
+
+        let node = scope_utils::scope_first_working_node_mut(cluster, &scope).unwrap();
         Ccm::stop_node(node).unwrap();
-        request_counter.add(node.ip.clone());
-        start_redirecting_proxy(node, &redirect_node, request_counter.get(&node.ip)).await;
     }
 }
 
@@ -751,8 +754,9 @@ async fn scope_fallback_test() {
     make_n_calls(&client, 5).await;
 
     scope_utils::shut_down_scope(cluster, &scope);
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &fallback_scope),
     )
     .await;
@@ -783,11 +787,13 @@ async fn primary_scope_recover_test() {
     start_redirecting_proxies(cluster, PROXY_PORT, &request_counter).await;
 
     let client = create_client_with_scope(cluster, scope.clone());
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &fallback_scope),
     )
     .await;
+    request_counter.reset_posts();
 
     let n = 20;
     make_n_calls(&client, n).await;
@@ -800,7 +806,7 @@ async fn primary_scope_recover_test() {
     let mut nodes = scope_utils::nodes_in_scope_mut(cluster, &scope);
     let node_to_start = &mut nodes[0];
     Ccm::start_node(node_to_start).unwrap();
-    wait_until_live_nodes_match(&client, vec![node_to_start.ip.as_str()]).await;
+    wait_until_requests_routed_to(&client, &request_counter, vec![node_to_start.ip.as_str()]).await;
 
     request_counter.reset();
     make_n_calls(&client, n).await;
@@ -873,11 +879,13 @@ async fn node_restart_test() {
     let counter = request_counter.get(&stopped_node_ip);
     start_proxy_on_node(restarted_node.clone(), PROXY_PORT, counter.clone()).await;
 
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &scope),
     )
     .await;
+    request_counter.reset_posts();
     make_n_calls(&client, 20).await;
     assert!(counter.posts() > 0);
 }
@@ -893,11 +901,13 @@ async fn round_robin_test() {
 
     let scope = scope_utils::datacenter_scope_from_index(cluster, 1);
     let client = create_client_with_scope(cluster, scope.clone());
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &scope),
     )
     .await;
+    request_counter.reset_posts();
 
     let n = 10;
 
@@ -1032,11 +1042,12 @@ async fn key_route_affinity_operation_matrix_test() {
 
     let table_name = format!("test_table_{}", uuid::Uuid::new_v4());
     {
-        // Drop the setup client before creating the three matrix clients: the
-        // test proxy accepts up to three concurrent client connections.
+        // Drop the setup client before creating the three matrix clients so its
+        // discovery and data connections do not remain active during the matrix.
         let setup_client = create_client_with_scope(cluster, scope.clone());
-        wait_until_live_nodes_match(
+        wait_until_requests_routed_to(
             &setup_client,
+            &request_counter,
             scope_utils::working_nodes_ips_in_scope(cluster, &scope),
         )
         .await;
@@ -1069,9 +1080,9 @@ async fn key_route_affinity_operation_matrix_test() {
     );
     let node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
 
-    wait_until_live_nodes_match(&none_client, node_ips.clone()).await;
-    wait_until_live_nodes_match(&rmw_client, node_ips.clone()).await;
-    wait_until_live_nodes_match(&any_write_client, node_ips.clone()).await;
+    wait_until_requests_routed_to(&none_client, &request_counter, node_ips.clone()).await;
+    wait_until_requests_routed_to(&rmw_client, &request_counter, node_ips.clone()).await;
+    wait_until_requests_routed_to(&any_write_client, &request_counter, node_ips.clone()).await;
 
     let mut cases = vec![
         OperationMatrixCase {
@@ -1304,7 +1315,7 @@ async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
     );
     let node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &scope);
 
-    wait_until_live_nodes_match(&client, node_ips.clone()).await;
+    wait_until_requests_routed_to(&client, &request_counter, node_ips.clone()).await;
     create_table(&client, &a_table_name).await;
     create_table(&client, &z_table_name).await;
 
@@ -1376,8 +1387,9 @@ async fn affinity_deterministic_routing_test() {
         .with_pk_info(&table_name, "id")
         .build();
     let client = create_client_with_scope_and_affinity(cluster, scope.clone(), affinity_config);
-    wait_until_live_nodes_match(
+    wait_until_requests_routed_to(
         &client,
+        &request_counter,
         scope_utils::working_nodes_ips_in_scope(cluster, &scope),
     )
     .await;

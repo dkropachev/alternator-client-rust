@@ -123,8 +123,12 @@ impl NodeCounter {
         self.connects.load(Ordering::Relaxed)
     }
 
-    fn reset(&self) {
+    fn reset_posts(&self) {
         self.posts.store(0, Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        self.reset_posts();
         self.gets.store(0, Ordering::Relaxed);
         self.describe_tables.store(0, Ordering::Relaxed);
         self.connects.store(0, Ordering::Relaxed);
@@ -139,12 +143,6 @@ pub(crate) struct RequestCounter {
 }
 
 impl RequestCounter {
-    pub(crate) fn new() -> Self {
-        Self {
-            counter: HashMap::new(),
-        }
-    }
-
     pub(crate) fn from_cluster(cluster: &Cluster) -> Self {
         let counter = cluster
             .nodes()
@@ -158,8 +156,10 @@ impl RequestCounter {
         Arc::clone(self.counter.get(ip).unwrap())
     }
 
-    pub(crate) fn add(&mut self, ip: String) {
-        self.counter.insert(ip, Arc::new(NodeCounter::new()));
+    pub(crate) fn reset_posts(&self) {
+        for c in self.counter.values() {
+            c.reset_posts();
+        }
     }
 
     pub(crate) fn reset(&self) {
@@ -347,24 +347,71 @@ pub(crate) fn create_client_with_scope_and_interval(
     )
 }
 
-// Poll until the client's live nodes match the given IPs, or timeout.
-pub(crate) async fn wait_until_live_nodes_match(client: &AlternatorClient, ips: Vec<&str>) {
-    let live_nodes = client.config().live_nodes().unwrap().clone();
-    tokio::time::timeout(POLLING_TIMEOUT, async {
+// Poll until requests are routed to exactly the expected nodes, or timeout.
+//
+// Each attempt compares POST deltas instead of clearing counters so callers can
+// retain GET and connection history. Sending one request per counter entry is
+// enough to traverse every node in any round-robin routing scope represented by
+// the counter.
+pub(crate) async fn wait_until_requests_routed_to(
+    client: &AlternatorClient,
+    request_counter: &RequestCounter,
+    mut expected_ips: Vec<&str>,
+) {
+    assert!(
+        !request_counter.counter.is_empty(),
+        "cannot observe request routing without node counters"
+    );
+    for ip in &expected_ips {
+        assert!(
+            request_counter.counter.contains_key(*ip),
+            "expected routing node {ip} has no request counter"
+        );
+    }
+    expected_ips.sort_unstable();
+    expected_ips.dedup();
+
+    let requests_per_attempt = request_counter.counter.len();
+    let mut last_observed = Vec::new();
+    let result = tokio::time::timeout(POLLING_TIMEOUT, async {
         loop {
-            let nodes = live_nodes.get_live_nodes();
-            let node_ips: Vec<&str> = nodes.iter().map(|url| url.host_str().unwrap()).collect();
-            if node_ips.len() == ips.len() && node_ips.iter().all(|ip| ips.contains(ip)) {
+            let posts_before: HashMap<&str, usize> = request_counter
+                .counter
+                .iter()
+                .map(|(ip, counter)| (ip.as_str(), counter.posts()))
+                .collect();
+
+            make_n_calls(client, requests_per_attempt).await;
+
+            last_observed = request_counter
+                .counter
+                .iter()
+                .filter_map(|(ip, counter)| {
+                    let new_posts = counter.posts() - posts_before[ip.as_str()];
+                    (new_posts > 0).then_some((ip.as_str(), new_posts))
+                })
+                .collect();
+            last_observed.sort_unstable_by_key(|(ip, _)| *ip);
+            let total_new_posts: usize = last_observed.iter().map(|(_, posts)| posts).sum();
+
+            if total_new_posts == requests_per_attempt
+                && last_observed.len() == expected_ips.len()
+                && last_observed
+                    .iter()
+                    .zip(&expected_ips)
+                    .all(|((observed, _), expected)| observed == expected)
+            {
                 break;
             }
             tokio::time::sleep(POLLING_INTERVAL).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| {
+    .await;
+
+    result.unwrap_or_else(|_| {
         panic!(
-            "failed to update nodes\nexpected nodes {:?}, timed out after {:?}",
-            ips, POLLING_TIMEOUT
+            "request routing did not converge within {:?}; expected nodes {:?}, last POST deltas {:?}",
+            POLLING_TIMEOUT, expected_ips, last_observed
         )
     });
 }

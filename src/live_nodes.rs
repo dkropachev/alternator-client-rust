@@ -17,8 +17,8 @@
 //! # Overview
 //!
 //! [`LiveNodes`] is constructed from an [`AlternatorConfig`] and seeded with a list of hosts.
-//! Once [`start`] is called, a background Tokio task
-//! periodically calls the [`update_live_nodes`] function which requests the known
+//! When [`ensure_discovery_started`] finds an active Tokio runtime, it launches a
+//! background task which periodically calls [`update_live_nodes`] to request the known
 //! nodes in a random order to get an updated list of live nodes. After a
 //! successful refresh, the list is updated to nodes from the highest available
 //! scope in the fallback chain provided by the user.
@@ -61,7 +61,7 @@
 //!  # Lifetime
 //!
 //! The background task holds a [`Weak`] reference to its [`LiveNodes`], so it
-//! terminates on its own once the last external [`Arc`] is dropped. [`Drop`]
+//! terminates on its own once the last owning [`Arc`] is dropped. [`Drop`]
 //! additionally aborts the task to avoid waiting out the current sleep.
 //!
 //! # Start-up
@@ -92,7 +92,6 @@
 //! [`idle_interval`]: LiveNodes::idle_interval
 //! [`mark_activity`]: LiveNodes::mark_activity
 //! [`ensure_discovery_started`]: LiveNodes::ensure_discovery_started
-//! [`start`]: LiveNodes::start
 //! [`update_live_nodes`]: LiveNodes::update_live_nodes
 //! [`get_next_node_round_robin`]: LiveNodes::get_next_node_round_robin
 //! [`get_live_nodes`]: LiveNodes::get_live_nodes
@@ -247,7 +246,7 @@ fn build_discovery_http_client(
 }
 
 #[derive(Debug)]
-pub struct LiveNodes {
+pub(crate) struct LiveNodes {
     routing_scope: RoutingScope,
     active_interval: Duration,
     idle_interval: Duration,
@@ -454,7 +453,8 @@ impl LiveNodes {
     /// discovery HTTP client cannot be constructed. Invalid routing
     /// configuration fails closed instead of falling back to an unrelated SDK
     /// endpoint.
-    pub fn new(config: &crate::config::AlternatorConfig) -> Option<Arc<Self>> {
+    #[cfg(test)]
+    pub(crate) fn new(config: &crate::config::AlternatorConfig) -> Option<Arc<Self>> {
         Self::try_new(config)
             .unwrap_or_else(|error| panic!("failed to construct LiveNodes: {error}"))
     }
@@ -661,7 +661,7 @@ impl LiveNodes {
     /// is available. A caller on another runtime keeps a healthy owner stable,
     /// but takes ownership when a probe confirms that the old runtime has shut
     /// down or cannot service the probe within the bounded interval.
-    pub fn ensure_discovery_started(self: &Arc<Self>) {
+    pub(crate) fn ensure_discovery_started(self: &Arc<Self>) {
         let Ok(handle) = Handle::try_current() else {
             return;
         };
@@ -775,7 +775,7 @@ impl LiveNodes {
     }
 
     /// Returns a list of all current live nodes and updates the last activity timestamp.
-    pub fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
+    pub(crate) fn get_live_nodes(self: &Arc<Self>) -> Vec<Arc<Url>> {
         self.ensure_discovery_started();
         self.mark_activity();
         self.live_nodes.load().as_ref().clone()
@@ -783,7 +783,7 @@ impl LiveNodes {
 
     /// Returns the first live node not in `used_nodes` starting with the next node in round-robin order.
     /// Used by [`crate::QueryPlan`] round-robin strategy.
-    pub fn get_next_node_round_robin(
+    pub(crate) fn get_next_node_round_robin(
         self: &Arc<Self>,
         used_nodes: &std::collections::HashSet<Arc<Url>>,
     ) -> Option<Arc<Url>> {
@@ -814,7 +814,7 @@ impl LiveNodes {
         None
     }
 
-    pub async fn update_live_nodes(&self) {
+    async fn update_live_nodes(&self) {
         let generation = self.begin_refresh();
         let mut scope = &self.routing_scope;
         // Live nodes in a random order.

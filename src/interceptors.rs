@@ -342,14 +342,14 @@ pub(crate) struct AffinityQueryPlanInterceptor {
 /// An interceptor that builds a partition-key-aware [QueryPlan] for
 /// qualifying requests, or a round-robin [QueryPlan] as a fallback.
 ///
-/// On the first attempt of each request, [`modify_before_serialization`]
+/// On the first attempt of each request, [`Intercept::modify_before_serialization`]
 /// inspects the operation type, extracts the partition key if one applies,
 /// and constructs an affinity [QueryPlan] so that subsequent retries prefer
 /// related coordinators. Requests that don't qualify (read operations,
 /// missing partition key info, unsupported PK types) get a basic round-robin
 /// plan instead.
 ///
-/// Partition key names are resolved lazily via [`PartitionKeyResolver`].
+/// Partition key names are resolved lazily via [`resolver::PartitionKeyResolver`].
 /// On a cache miss, the request falls back to round-robin and discovery
 /// is triggered in the background for next time.
 impl AffinityQueryPlanInterceptor {
