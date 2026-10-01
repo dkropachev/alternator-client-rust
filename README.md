@@ -97,7 +97,7 @@ Alternator supports no-auth and SigV4 signing through configured or per-request 
 
 [ScyllaDB's Alternator authentication documentation](https://docs.scylladb.com/manual/stable/alternator/compatibility.html#authentication-and-authorization) explains how to enable request validation with `alternator_enforce_authorization: true`. Alternator uses CQL role credentials rather than AWS IAM credentials: the role name is the access key ID and its `salted_hash` is the secret access key.
 
-Header optimization detects SigV4 requests and retains the headers signed by the pinned AWS DynamoDB SDK. Clients that add custom headers before signing should set `.optimize_headers(false)`, because [Alternator's verifier reconstructs and validates every header named by `SignedHeaders`](https://github.com/scylladb/scylladb/blob/942e15ba0173594b919849a42590550c338c6731/alternator/server.cc#L303-L454).
+Header optimization detects SigV4 requests and retains every header named by the actual `SignedHeaders` value, including custom headers added before signing. [Alternator's verifier reconstructs and validates every signed header](https://github.com/scylladb/scylladb/blob/942e15ba0173594b919849a42590550c338c6731/alternator/server.cc#L303-L454), so the optimizer leaves a signed request intact if it cannot parse that value safely.
 
 This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
@@ -443,17 +443,9 @@ When a request is signed, the optimizer also keeps:
 - `x-amz-date`
 - `x-amz-user-agent`
 - `x-amz-security-token` when session credentials are used
+- every header named by the request's `Authorization` `SignedHeaders` value
 
-These additions preserve the `SignedHeaders` emitted by the pinned AWS DynamoDB SDK. Header optimization runs after signing, so disable it when a custom interceptor adds other signed headers:
-
-```rust
-use alternator_driver::AlternatorConfig;
-
-let config = AlternatorConfig::builder()
-    .optimize_headers(false)
-    // Add custom signing interceptors here.
-    .build();
-```
+This preserves signatures across compatible AWS SDK updates and for custom headers added before signing, while still removing unrelated unsigned metadata. If the optimizer cannot understand a signed request's authorization value, it skips stripping for that request rather than risk invalidating the signature.
 
 ## Request compression
 

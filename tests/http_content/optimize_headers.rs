@@ -25,18 +25,19 @@
 //! 2. Without credentials, with injected auth headers:
 //!    Disable credentials, inject auth headers before header stripping, and
 //!    verify that requests still follow the no-auth whitelist.
-//! 3. With per-request credentials:
+//! 3. With per-request credentials and custom headers:
 //!    Disable global credentials, provide credentials through a single SDK
-//!    operation override, prefer SigV4 auth, and verify that all headers named
-//!    by `SignedHeaders` survive filtering.
+//!    operation override, add headers before and after signing, and verify that
+//!    all headers named by `SignedHeaders` survive filtering while the unsigned
+//!    custom header is removed.
 //! 4. Without per-request credentials:
 //!    Disable global credentials, prefer SigV4 auth, and verify that a missing
 //!    per-request credentials override fails locally instead of being sent
 //!    unsigned.
-//! 5. With credentials:
+//! 5. With credentials and custom headers:
 //!    Enable credentials and verify that the optimized request follows this
-//!    whitelist and retains every header named by `SignedHeaders`:
-//!    ["host", "x-amz-target", "content-length", "content-type", "accept-encoding", "content-encoding", "user-agent", "authorization", "x-amz-date", "x-amz-user-agent", "x-amz-security-token"]
+//!    whitelist and retains every header named by `SignedHeaders`, including a
+//!    custom header added before signing.
 //! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
@@ -94,6 +95,40 @@ impl aws_sdk_dynamodb::config::Intercept for InjectAuthHeadersInterceptor {
         let headers = context.request_mut().headers_mut();
         headers.insert("authorization", "AWS4-HMAC-SHA256 fake");
         headers.insert("x-amz-date", "20260626T120000Z");
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct InjectCustomHeadersInterceptor;
+impl aws_sdk_dynamodb::config::Intercept for InjectCustomHeadersInterceptor {
+    fn name(&self) -> &'static str {
+        "InjectCustomHeadersInterceptor"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        context
+            .request_mut()
+            .headers_mut()
+            .insert("x-custom-signed", "preserve-me");
+        Ok(())
+    }
+
+    fn modify_before_transmit(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        context
+            .request_mut()
+            .headers_mut()
+            .insert("x-custom-unsigned", "remove-me");
         Ok(())
     }
 }
@@ -366,6 +401,7 @@ pub async fn test_per_request_credentials_keep_signed_headers(
             .without_discovery()
             .optimize_headers(true)
             .require_auth()
+            .interceptor(InjectCustomHeadersInterceptor)
             .build(),
     );
 
@@ -413,7 +449,22 @@ impl HttpTestConfig for WithCredentialsConfig {
     ) -> Response<Full<Bytes>> {
         let (parts, body) = collect_request(request).await;
 
-        // allow only whitelisted headers
+        let authorization = parts
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let signed_headers = authorization
+            .split_once("SignedHeaders=")
+            .unwrap()
+            .1
+            .split([',', ' '])
+            .next()
+            .unwrap();
+
+        // Allow only the base and authenticated lists, the final user-agent,
+        // and fields protected by the request's actual signature.
         let whitelist = [
             "host",
             "x-amz-target",
@@ -428,10 +479,12 @@ impl HttpTestConfig for WithCredentialsConfig {
             "user-agent",
         ];
 
-        let rogue = parts
-            .headers
-            .keys()
-            .find(|header| !whitelist.contains(&header.as_str()));
+        let rogue = parts.headers.keys().find(|header| {
+            !whitelist.contains(&header.as_str())
+                && !signed_headers
+                    .split(';')
+                    .any(|signed| signed == header.as_str())
+        });
 
         assert!(
             rogue.is_none(),
@@ -439,19 +492,11 @@ impl HttpTestConfig for WithCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
-        let authorization = parts
-            .headers
-            .get("authorization")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        let signed_headers = authorization
-            .split_once("SignedHeaders=")
-            .unwrap()
-            .1
-            .split([',', ' '])
-            .next()
-            .unwrap();
+        assert!(
+            signed_headers
+                .split(';')
+                .any(|header| header == "x-custom-signed")
+        );
         for header in signed_headers.split(';') {
             assert!(
                 parts.headers.contains_key(header),
@@ -463,6 +508,8 @@ impl HttpTestConfig for WithCredentialsConfig {
         assert!(parts.headers.contains_key("x-amz-date"));
         assert!(parts.headers.contains_key("x-amz-user-agent"));
         assert!(parts.headers.contains_key("x-amz-security-token"));
+        assert_eq!(parts.headers.get("x-custom-signed").unwrap(), "preserve-me");
+        assert!(!parts.headers.contains_key("x-custom-unsigned"));
         assert_eq!(parts.headers.get("user-agent").unwrap(), DEFAULT_USER_AGENT);
 
         // forward
@@ -485,6 +532,7 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
             .port(ctx.get_proxy_port())
             .without_discovery()
             .optimize_headers(true)
+            .interceptor(InjectCustomHeadersInterceptor)
             .credentials_provider(
                 aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
             )
