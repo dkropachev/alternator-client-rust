@@ -30,7 +30,9 @@ pub use crate::compression::*;
 pub use crate::config::*;
 pub use crate::customize::*;
 pub(crate) use crate::interceptors::*;
-pub use crate::keyrouting::{KeyRouteAffinityConfig, KeyRouteAffinityType};
+pub use crate::keyrouting::{
+    KeyRouteAffinityConfig, KeyRouteAffinityConfigBuilder, KeyRouteAffinityType,
+};
 pub(crate) use crate::live_nodes::*;
 pub(crate) use crate::optimize_headers::*;
 pub(crate) use crate::query_plan::*;
