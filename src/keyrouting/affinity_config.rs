@@ -101,6 +101,21 @@ impl From<KeyRouteAffinityType> for KeyRouteAffinityConfig {
 }
 
 impl KeyRouteAffinityConfig {
+    /// Creates a builder for an affinity mode and optional table metadata.
+    ///
+    /// ```
+    /// use alternator_driver::{
+    ///     KeyRouteAffinityConfig,
+    ///     KeyRouteAffinityConfigBuilder,
+    ///     KeyRouteAffinityType,
+    /// };
+    ///
+    /// let builder: KeyRouteAffinityConfigBuilder = KeyRouteAffinityConfig::builder()
+    ///     .with_type(KeyRouteAffinityType::Rmw)
+    ///     .with_pk_info("users", "user_id");
+    /// let config = builder.build();
+    /// assert!(config.is_enabled());
+    /// ```
     pub fn builder() -> KeyRouteAffinityConfigBuilder {
         KeyRouteAffinityConfigBuilder::new()
     }

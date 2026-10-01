@@ -18,4 +18,6 @@ pub(crate) mod deterministic_rng;
 pub(crate) mod hasher;
 pub(crate) mod resolver;
 
-pub use affinity_config::{KeyRouteAffinityConfig, KeyRouteAffinityType};
+pub use affinity_config::{
+    KeyRouteAffinityConfig, KeyRouteAffinityConfigBuilder, KeyRouteAffinityType,
+};
