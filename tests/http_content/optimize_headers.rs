@@ -21,22 +21,22 @@
 //! There are eight test cases:
 //! 1. Without credentials:
 //!    Disable credentials and verify that requests follow this whitelist:
-//!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "user-agent"]
+//!    ["host", "x-amz-target", "content-length", "content-type", "accept-encoding", "content-encoding", "user-agent"]
 //! 2. Without credentials, with injected auth headers:
 //!    Disable credentials, inject auth headers before header stripping, and
 //!    verify that requests still follow the no-auth whitelist.
 //! 3. With per-request credentials:
 //!    Disable global credentials, provide credentials through a single SDK
-//!    operation override, prefer SigV4 auth, and verify that the authorization
-//!    marker headers survive filtering. This does not validate the signature.
+//!    operation override, prefer SigV4 auth, and verify that all headers named
+//!    by `SignedHeaders` survive filtering.
 //! 4. Without per-request credentials:
 //!    Disable global credentials, prefer SigV4 auth, and verify that a missing
 //!    per-request credentials override fails locally instead of being sent
 //!    unsigned.
 //! 5. With credentials:
 //!    Enable credentials and verify that the optimized request follows this
-//!    whitelist (without asserting that its signature remains valid):
-//!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "user-agent", "authorization", "x-amz-date"]
+//!    whitelist and retains every header named by `SignedHeaders`:
+//!    ["host", "x-amz-target", "content-length", "content-type", "accept-encoding", "content-encoding", "user-agent", "authorization", "x-amz-date", "x-amz-user-agent", "x-amz-security-token"]
 //! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
 //!    unnecessary headers are present, confirming that stripping is useful.
@@ -75,7 +75,7 @@ use aws_sdk_dynamodb::types::{
 use alternator_driver::*;
 
 fn request_credentials() -> aws_sdk_dynamodb::config::Credentials {
-    aws_sdk_dynamodb::config::Credentials::for_tests()
+    aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token()
 }
 
 #[derive(Debug)]
@@ -208,6 +208,7 @@ impl HttpTestConfig for WithoutCredentialsConfig {
             "host",
             "x-amz-target",
             "content-length",
+            "content-type",
             "accept-encoding",
             "content-encoding",
             "user-agent",
@@ -224,9 +225,12 @@ impl HttpTestConfig for WithoutCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        assert!(parts.headers.contains_key("content-type"));
         assert_eq!(parts.headers.get("user-agent").unwrap(), DEFAULT_USER_AGENT);
         assert!(!parts.headers.contains_key("authorization"));
         assert!(!parts.headers.contains_key("x-amz-date"));
+        assert!(!parts.headers.contains_key("x-amz-user-agent"));
+        assert!(!parts.headers.contains_key("x-amz-security-token"));
 
         // forward
         let (parts, body) = collect_received_response(parts, body, sender).await;
@@ -352,7 +356,7 @@ pub async fn test_without_credentials_drops_injected_auth_headers(
 
 #[test_context(HttpTestContext<WithCredentialsConfig>)]
 #[tokio::test]
-pub async fn test_per_request_credentials_keep_auth_markers(
+pub async fn test_per_request_credentials_keep_signed_headers(
     ctx: &mut HttpTestContext<WithCredentialsConfig>,
 ) {
     let client = AlternatorClient::from_conf(
@@ -414,10 +418,13 @@ impl HttpTestConfig for WithCredentialsConfig {
             "host",
             "x-amz-target",
             "content-length",
+            "content-type",
             "accept-encoding",
             "content-encoding",
             "authorization",
             "x-amz-date",
+            "x-amz-user-agent",
+            "x-amz-security-token",
             "user-agent",
         ];
 
@@ -432,8 +439,30 @@ impl HttpTestConfig for WithCredentialsConfig {
             rogue.unwrap(),
             whitelist
         );
+        let authorization = parts
+            .headers
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let signed_headers = authorization
+            .split_once("SignedHeaders=")
+            .unwrap()
+            .1
+            .split([',', ' '])
+            .next()
+            .unwrap();
+        for header in signed_headers.split(';') {
+            assert!(
+                parts.headers.contains_key(header),
+                "signed header {header:?} was removed from the request"
+            );
+        }
+        assert!(parts.headers.contains_key("content-type"));
         assert!(parts.headers.contains_key("authorization"));
         assert!(parts.headers.contains_key("x-amz-date"));
+        assert!(parts.headers.contains_key("x-amz-user-agent"));
+        assert!(parts.headers.contains_key("x-amz-security-token"));
         assert_eq!(parts.headers.get("user-agent").unwrap(), DEFAULT_USER_AGENT);
 
         // forward
@@ -456,7 +485,9 @@ pub async fn test_with_credentials(ctx: &mut HttpTestContext<WithCredentialsConf
             .port(ctx.get_proxy_port())
             .without_discovery()
             .optimize_headers(true)
-            .credentials_provider(aws_sdk_dynamodb::config::Credentials::for_tests())
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
             .build(),
     );
 
@@ -478,10 +509,13 @@ impl HttpTestConfig for WhitelistNeededConfig {
             "host",
             "x-amz-target",
             "content-length",
+            "content-type",
             "accept-encoding",
             "content-encoding",
             "authorization",
             "x-amz-date",
+            "x-amz-user-agent",
+            "x-amz-security-token",
             "user-agent",
         ];
 

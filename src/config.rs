@@ -143,9 +143,9 @@ impl AlternatorConfig {
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside these headers after this happens.
     ///
-    /// Header optimization is incompatible with SigV4 because it runs after
-    /// signing and may remove headers named by `SignedHeaders`. SigV4 clients
-    /// must set this to `false`.
+    /// Signed requests retain the headers used by the pinned AWS DynamoDB
+    /// SDK's SigV4 implementation. Because optimization runs after signing,
+    /// clients that add custom signed headers must set this to `false`.
     ///
     /// Turned on by default.
     pub fn optimize_headers(&self) -> Option<bool> {
@@ -429,9 +429,9 @@ impl AlternatorBuilder {
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside these headers after this happens.
     ///
-    /// Header optimization is incompatible with SigV4 because it runs after
-    /// signing and may remove headers named by `SignedHeaders`. SigV4 clients
-    /// must set this to `false`.
+    /// Signed requests retain the headers used by the pinned AWS DynamoDB
+    /// SDK's SigV4 implementation. Because optimization runs after signing,
+    /// clients that add custom signed headers must set this to `false`.
     ///
     /// Turned on by default.
     pub fn optimize_headers(mut self, optimize: bool) -> Self {
@@ -1176,8 +1176,8 @@ impl AlternatorBuilder {
 
     /// Configures the default credentials provider used to sign requests.
     ///
-    /// SigV4 clients must also disable header optimization with
-    /// [`Self::optimize_headers(false)`](Self::optimize_headers).
+    /// When header optimization is enabled, the driver's authenticated
+    /// allowlist is selected automatically.
     pub fn credentials_provider(
         mut self,
         credentials_provider: impl aws_sdk_dynamodb::config::ProvideCredentials + 'static,
@@ -1193,8 +1193,8 @@ impl AlternatorBuilder {
     /// Passing `None` removes a previously configured provider. Unless
     /// [`require_auth`](Self::require_auth) is enabled, clients built from the
     /// resulting configuration permit unsigned requests automatically.
-    /// SigV4 clients must also disable header optimization with
-    /// [`Self::optimize_headers(false)`](Self::optimize_headers).
+    /// When header optimization is enabled, the driver's authenticated
+    /// allowlist is selected automatically.
     pub fn set_credentials_provider(
         &mut self,
         credentials_provider: Option<aws_sdk_dynamodb::config::SharedCredentialsProvider>,

@@ -1032,6 +1032,8 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         authorization: std::sync::atomic::AtomicBool,
         amz_date: std::sync::atomic::AtomicBool,
+        content_type: std::sync::atomic::AtomicBool,
+        amz_user_agent: std::sync::atomic::AtomicBool,
         security_token: std::sync::atomic::AtomicBool,
     }
 
@@ -1059,6 +1061,14 @@ mod tests {
             );
             self.0.amz_date.store(
                 request.headers().contains_key("x-amz-date"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.0.content_type.store(
+                request.headers().contains_key("content-type"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.0.amz_user_agent.store(
+                request.headers().contains_key("x-amz-user-agent"),
                 std::sync::atomic::Ordering::SeqCst,
             );
             self.0.security_token.store(
@@ -1112,6 +1122,91 @@ mod tests {
         assert!(!captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
         assert!(
             !captured
+                .security_token
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_unsigned_request_uses_base_header_allowlist() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let client = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .without_discovery()
+                .optimize_headers(true)
+                .http_client(SuccessfulHttpClient(captured.clone()))
+                .build(),
+        )
+        .unwrap();
+
+        let result = client.list_tables().send().await;
+
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert_eq!(captured.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            captured
+                .content_type
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            !captured
+                .authorization
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(!captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !captured
+                .amz_user_agent
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            !captured
+                .security_token
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn optimized_signed_request_uses_authenticated_header_allowlist() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let client = AlternatorClient::try_from_conf(
+            AlternatorConfig::builder()
+                .seed_hosts(["127.0.0.1"])
+                .port(8000)
+                .without_discovery()
+                .optimize_headers(true)
+                .http_client(SuccessfulHttpClient(captured.clone()))
+                .credentials_provider(
+                    aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+                )
+                .build(),
+        )
+        .unwrap();
+
+        let result = client.list_tables().send().await;
+
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert_eq!(captured.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            captured
+                .authorization
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            captured
+                .content_type
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            captured
+                .amz_user_agent
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            captured
                 .security_token
                 .load(std::sync::atomic::Ordering::SeqCst)
         );

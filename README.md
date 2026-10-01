@@ -97,7 +97,7 @@ Alternator supports no-auth and SigV4 signing through configured or per-request 
 
 [ScyllaDB's Alternator authentication documentation](https://docs.scylladb.com/manual/stable/alternator/compatibility.html#authentication-and-authorization) explains how to enable request validation with `alternator_enforce_authorization: true`. Alternator uses CQL role credentials rather than AWS IAM credentials: the role name is the access key ID and its `salted_hash` is the secret access key.
 
-For version 0.1, SigV4 clients must set `.optimize_headers(false)`. Header optimization runs after AWS SDK signing and can remove headers named by `SignedHeaders`; [Alternator's verifier reconstructs and validates every signed header](https://github.com/scylladb/scylladb/blob/942e15ba0173594b919849a42590550c338c6731/alternator/server.cc#L303-L454), so an optimized signed request can be rejected. Unsigned clients can keep the default optimization.
+Header optimization detects SigV4 requests and retains the headers signed by the pinned AWS DynamoDB SDK. Clients that add custom headers before signing should set `.optimize_headers(false)`, because [Alternator's verifier reconstructs and validates every header named by `SignedHeaders`](https://github.com/scylladb/scylladb/blob/942e15ba0173594b919849a42590550c338c6731/alternator/server.cc#L303-L454).
 
 This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
@@ -109,8 +109,8 @@ There is no `AlternatorClient::new(&SdkConfig)`, `AlternatorConfig::new(&SdkConf
 
 Supported auth modes are:
 - no-auth, enabled automatically when no credentials provider is configured, or explicitly with `allow_no_auth()`
-- SigV4 with a credentials provider configured through `credentials_provider(...)` and header optimization disabled
-- SigV4 with per-request credentials, usually with a client built using `require_auth()`, and header optimization disabled
+- SigV4 with a credentials provider configured through `credentials_provider(...)`
+- SigV4 with per-request credentials, usually with a client built using `require_auth()`
 
 The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, custom endpoint resolvers, or an SDK `endpoint_url(...)` builder setter. These APIs are intentionally absent rather than accepted and ignored. Use the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing; the SDK endpoint follows from them. Use `user_agent(...)` for Alternator client identification.
 
@@ -433,6 +433,7 @@ By default, the AWS Rust SDK attaches a number of headers to every DynamoDB requ
 - `host`
 - `x-amz-target`
 - `content-length`
+- `content-type`
 - `accept-encoding`
 - `content-encoding`
 - `user-agent` unless disabled with `without_user_agent()`
@@ -440,30 +441,18 @@ By default, the AWS Rust SDK attaches a number of headers to every DynamoDB requ
 When a request is signed, the optimizer also keeps:
 - `authorization`
 - `x-amz-date`
+- `x-amz-user-agent`
+- `x-amz-security-token` when session credentials are used
 
-This allowlist is intended for unsigned Alternator requests. It does not retain every header that the AWS SDK may include in `SignedHeaders`, so preserving only `authorization` and `x-amz-date` is not enough to keep a signature valid. Disable header optimization for every SigV4 client:
+These additions preserve the `SignedHeaders` emitted by the pinned AWS DynamoDB SDK. Header optimization runs after signing, so disable it when a custom interceptor adds other signed headers:
 
 ```rust
-use alternator_driver::{AlternatorConfig, AlternatorClient};
-use aws_sdk_dynamodb::config::Credentials;
+use alternator_driver::AlternatorConfig;
 
-let credentials = Credentials::new(
-    std::env::var("ALTERNATOR_ACCESS_KEY_ID").unwrap(),
-    std::env::var("ALTERNATOR_SECRET_ACCESS_KEY").unwrap(),
-    None,
-    None,
-    "Alternator",
-);
-
-let client = AlternatorClient::from_conf(
-    AlternatorConfig::builder()
-        .scheme("https")
-        .seed_hosts(["alternator.example.com"])
-        .port(8043)
-        .credentials_provider(credentials)
-        .optimize_headers(false)
-        .build(),
-);
+let config = AlternatorConfig::builder()
+    .optimize_headers(false)
+    // Add custom signing interceptors here.
+    .build();
 ```
 
 ## Request compression
