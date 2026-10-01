@@ -21,6 +21,7 @@ use flate2::read::{GzDecoder, GzEncoder, ZlibDecoder, ZlibEncoder};
 pub use flate2::Compression as CompressionLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompressionAlgorithm {
     Gzip,
     Deflate,
@@ -104,6 +105,7 @@ fn decompress_zlib(content: &[u8]) -> Option<Vec<u8>> {
 /// Used to specify which encodings the client is willing to accept
 /// in the `Accept-Encoding` HTTP header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResponseCompressionAlgorithm {
     Gzip,
     Deflate,

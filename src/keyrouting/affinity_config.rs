@@ -19,6 +19,7 @@ use std::collections::HashMap;
 /// See [`KeyRouteAffinityConfig`] for the full configuration object that
 /// carries this mode plus any pre-configured partition key names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum KeyRouteAffinityType {
     /// Standard round-robin load balancing across all live nodes. No
     /// affinity is applied to any request. This is the default.
@@ -85,10 +86,10 @@ pub enum KeyRouteAffinityType {
 #[derive(Debug, Clone)]
 pub struct KeyRouteAffinityConfig {
     /// Which operations qualify for partition-key routing.
-    pub affinity_type: KeyRouteAffinityType,
+    pub(crate) affinity_type: KeyRouteAffinityType,
     /// Pre-configured table name to partition key attribute name. Tables
     /// not in this map are resolved at runtime via `DescribeTable`.
-    pub pk_info_per_table: HashMap<String, String>,
+    pub(crate) pk_info_per_table: HashMap<String, String>,
 }
 
 impl From<KeyRouteAffinityType> for KeyRouteAffinityConfig {
@@ -118,6 +119,16 @@ impl KeyRouteAffinityConfig {
     /// ```
     pub fn builder() -> KeyRouteAffinityConfigBuilder {
         KeyRouteAffinityConfigBuilder::new()
+    }
+
+    /// Returns which operations qualify for partition-key routing.
+    pub fn affinity_type(&self) -> KeyRouteAffinityType {
+        self.affinity_type
+    }
+
+    /// Returns the pre-configured partition key names indexed by table name.
+    pub fn pk_info_per_table(&self) -> &HashMap<String, String> {
+        &self.pk_info_per_table
     }
 
     /// `true` if any affinity-routing should happen for this configuration.
@@ -170,9 +181,9 @@ mod tests {
     #[test]
     fn default_is_none_and_disabled() {
         let cfg: KeyRouteAffinityConfig = KeyRouteAffinityType::default().into();
-        assert_eq!(cfg.affinity_type, KeyRouteAffinityType::None);
+        assert_eq!(cfg.affinity_type(), KeyRouteAffinityType::None);
         assert!(!cfg.is_enabled());
-        assert!(cfg.pk_info_per_table.is_empty());
+        assert!(cfg.pk_info_per_table().is_empty());
     }
 
     #[test]
@@ -189,15 +200,15 @@ mod tests {
     #[test]
     fn from_type_produces_empty_pk_map() {
         let cfg: KeyRouteAffinityConfig = KeyRouteAffinityType::Rmw.into();
-        assert_eq!(cfg.affinity_type, KeyRouteAffinityType::Rmw);
-        assert!(cfg.pk_info_per_table.is_empty());
+        assert_eq!(cfg.affinity_type(), KeyRouteAffinityType::Rmw);
+        assert!(cfg.pk_info_per_table().is_empty());
     }
 
     #[test]
     fn builder_default_matches_none_type() {
         let cfg = KeyRouteAffinityConfig::builder().build();
-        assert_eq!(cfg.affinity_type, KeyRouteAffinityType::None);
-        assert!(cfg.pk_info_per_table.is_empty());
+        assert_eq!(cfg.affinity_type(), KeyRouteAffinityType::None);
+        assert!(cfg.pk_info_per_table().is_empty());
     }
 
     #[test]
@@ -205,7 +216,7 @@ mod tests {
         let cfg = KeyRouteAffinityConfig::builder()
             .with_type(KeyRouteAffinityType::AnyWrite)
             .build();
-        assert_eq!(cfg.affinity_type, KeyRouteAffinityType::AnyWrite);
+        assert_eq!(cfg.affinity_type(), KeyRouteAffinityType::AnyWrite);
     }
 
     #[test]
@@ -216,14 +227,14 @@ mod tests {
             .with_pk_info("orders", "order_id")
             .build();
 
-        assert_eq!(cfg.affinity_type, KeyRouteAffinityType::Rmw);
-        assert_eq!(cfg.pk_info_per_table.len(), 2);
+        assert_eq!(cfg.affinity_type(), KeyRouteAffinityType::Rmw);
+        assert_eq!(cfg.pk_info_per_table().len(), 2);
         assert_eq!(
-            cfg.pk_info_per_table.get("users").map(String::as_str),
+            cfg.pk_info_per_table().get("users").map(String::as_str),
             Some("user_id")
         );
         assert_eq!(
-            cfg.pk_info_per_table.get("orders").map(String::as_str),
+            cfg.pk_info_per_table().get("orders").map(String::as_str),
             Some("order_id")
         );
     }
@@ -235,9 +246,9 @@ mod tests {
             .with_pk_info("users", "new_pk")
             .build();
         assert_eq!(
-            cfg.pk_info_per_table.get("users").map(String::as_str),
+            cfg.pk_info_per_table().get("users").map(String::as_str),
             Some("new_pk")
         );
-        assert_eq!(cfg.pk_info_per_table.len(), 1);
+        assert_eq!(cfg.pk_info_per_table().len(), 1);
     }
 }

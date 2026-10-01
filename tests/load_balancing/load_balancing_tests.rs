@@ -303,6 +303,7 @@ fn mode_name(mode: KeyRouteAffinityType) -> &'static str {
         KeyRouteAffinityType::None => "none",
         KeyRouteAffinityType::Rmw => "rmw",
         KeyRouteAffinityType::AnyWrite => "any_write",
+        _ => unreachable!("test matrix contains only known affinity types"),
     }
 }
 
@@ -1267,6 +1268,7 @@ async fn key_route_affinity_operation_matrix_test() {
             KeyRouteAffinityType::None => &none_client,
             KeyRouteAffinityType::Rmw => &rmw_client,
             KeyRouteAffinityType::AnyWrite => &any_write_client,
+            _ => unreachable!("test matrix contains only known affinity types"),
         };
         let case_label = format!("{}_{}", mode_name(case.mode), case.operation.name());
         let key = format!("matrix_key_{case_label}");
