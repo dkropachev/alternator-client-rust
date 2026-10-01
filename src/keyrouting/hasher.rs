@@ -53,19 +53,14 @@
 //! This behavior preserves the exact representation stored in DynamoDB and matches how DynamoDB
 //! itself handles number comparisons in certain contexts.
 //!
-//! # Cross-Language compatibility
+//! # Stable affinity hash format
 //!
-//! This hashing implementation is designed to be compatible with other Alternator client
-//! libraries (e.g., the Go client). For clients to produce identical hashes for the same partition
-//! key values, all implementations must follow the same encoding format:
+//! Affinity routing encodes supported partition-key values as follows:
 //!
 //! * Type prefixes must use the exact byte values (0x01 for S, 0x02 for N, 0x03 for B)
 //! * Strings must be encoded as UTF-8 bytes
 //! * The MurmurHash3 implementation must use the x64_128 variant with seed 0, returning the
 //!   first 64 bits
-//!
-//! If you are implementing a compatible hasher in another language, ensure your implementation
-//! passes the same test vectors as this Rust implementation.
 //!
 //! # Performance Characteristics
 //!
@@ -73,15 +68,15 @@
 //!
 //! Space complexity is O(n) as the entire value is converted to bytes before hashing.
 
-use crate::keyrouting::murmurhash3;
 use aws_sdk_dynamodb::types::AttributeValue;
+use std::io::Cursor;
 
-// Type prefix constants to match Java/Go Alternator hashing
+// Type prefixes for the affinity hash format.
 const TYPE_STRING: u8 = 0x01;
 const TYPE_NUMBER: u8 = 0x02;
 const TYPE_BINARY: u8 = 0x03;
 
-/// Computes the cross-language compatible hash for a DynamoDB AttributeValue partition key.
+/// Computes the affinity hash for a DynamoDB `AttributeValue` partition key.
 pub fn hash_attribute_value(value: &AttributeValue) -> Option<u64> {
     let (prefix, bytes): (u8, &[u8]) = match value {
         AttributeValue::S(s) => (TYPE_STRING, s.as_bytes()),
@@ -92,12 +87,12 @@ pub fn hash_attribute_value(value: &AttributeValue) -> Option<u64> {
     let mut data = Vec::with_capacity(1 + bytes.len());
     data.push(prefix);
     data.extend_from_slice(bytes);
-    Some(murmurhash3::hash(&data))
+    let hash = murmur3::murmur3_x64_128(&mut Cursor::new(data), 0)
+        .expect("reading from an in-memory partition key cannot fail");
+    Some(hash as u64)
 }
 
-/// Cross-language compatibility tests for hasher.
-/// These tests use exact expected hash values from the cross-language specification to ensure
-/// Compatibility with implementations in other languages (e.g., Go).
+/// Fixed-vector tests for the affinity hash format.
 //
 // Only S (String), N (Number), and B (Binary) types are tested as these are the only partition
 // key types supported by ScyllaDB Alternator.

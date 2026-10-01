@@ -14,12 +14,11 @@
 
 pub mod affinity_config;
 pub(crate) mod classifier;
-// Expose for tests.
+// Expose for integration tests.
 #[doc(hidden)]
-pub mod go_rand;
+pub mod deterministic_rng;
 #[doc(hidden)]
 pub mod hasher;
-pub(crate) mod murmurhash3;
 pub(crate) mod resolver;
 
 pub use affinity_config::{KeyRouteAffinityConfig, KeyRouteAffinityType};

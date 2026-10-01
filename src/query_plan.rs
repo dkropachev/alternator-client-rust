@@ -17,7 +17,7 @@
 //! The object is stored in the config and is used on each request to determine
 //! which node to send the request to.
 
-use crate::keyrouting::go_rand::GoRand;
+use crate::keyrouting::deterministic_rng::DeterministicRng;
 use crate::live_nodes::LiveNodes;
 use aws_smithy_types::config_bag::{Storable, StoreReplace};
 use std::collections::{HashSet, VecDeque};
@@ -42,8 +42,7 @@ enum QueryPlanState {
     /// Seeded deterministic state for Key Route Affinity
     Affinity {
         seed: i64,
-        // Boxed to prevent "large size difference between variants" warning
-        go_rand: Box<GoRand>,
+        rng: DeterministicRng,
         remaining_nodes: Option<Vec<Arc<Url>>>,
     },
     /// Deterministic order with selected nodes before the rest.
@@ -68,13 +67,13 @@ impl QueryPlan {
         }
     }
 
-    /// Creates a seeded affinity query plan using GoRand
+    /// Creates a seeded deterministic affinity query plan.
     pub fn new_with_hash(live_nodes: Arc<LiveNodes>, seed: u64) -> Self {
         Self {
             live_nodes,
             state: Mutex::new(QueryPlanState::Affinity {
                 seed: seed as i64,
-                go_rand: Box::new(GoRand::new(seed as i64)),
+                rng: DeterministicRng::new(seed as i64),
                 remaining_nodes: None,
             }),
         }
@@ -106,7 +105,7 @@ impl QueryPlan {
     /// With round-robin, on every attempt, the first node that hasn't been used yet in this request is returned.
     /// Search begins from the last used node in the live nodes list, so that requests are distributed evenly across the cluster.
     ///
-    /// With affinity, the next node is selected from the remaining nodes using the pick-and-remove algorithm with GoRand.
+    /// With affinity, the next node is selected from the remaining nodes using a seeded pick-and-remove algorithm.
     pub fn next_node(&self) -> Option<Arc<Url>> {
         let mut state = self.state.lock().unwrap();
 
@@ -117,7 +116,7 @@ impl QueryPlan {
                 Some(node)
             }
             QueryPlanState::Affinity {
-                go_rand,
+                rng,
                 remaining_nodes,
                 ..
             } => {
@@ -132,7 +131,7 @@ impl QueryPlan {
                 }
 
                 // Pick-and-Remove Algorithm.
-                let idx = go_rand.intn(remaining.len() as i32) as usize;
+                let idx = rng.index(remaining.len());
                 let selected_node = remaining[idx].clone();
                 let last_idx = remaining.len() - 1;
 
@@ -191,12 +190,12 @@ impl QueryPlan {
             QueryPlanState::RoundRobin { used_nodes } => used_nodes.clear(),
             QueryPlanState::Affinity {
                 seed,
-                go_rand,
+                rng,
                 remaining_nodes,
             } => {
                 // Re-seeding repeats the deterministic affinity order and
                 // puts the preferred coordinator first again.
-                **go_rand = GoRand::new(*seed);
+                *rng = DeterministicRng::new(*seed);
                 *remaining_nodes = None;
             }
             QueryPlanState::PreferredNodes {
@@ -220,8 +219,8 @@ impl SortedAffinityNodes {
             return None;
         }
 
-        let mut go_rand = GoRand::new(seed as i64);
-        let idx = go_rand.intn(self.nodes.len() as i32) as usize;
+        let mut rng = DeterministicRng::new(seed as i64);
+        let idx = rng.index(self.nodes.len());
         Some(self.nodes[idx].clone())
     }
 }
@@ -300,82 +299,82 @@ mod tests {
         out
     }
 
-    // ----- Cross-language test vectors -----
+    // ----- Stable routing test vectors -----
     //
     // These vectors use the canonical lexicographic live-node order.
 
     #[test]
-    fn cross_lang_seed_42_10_nodes() {
+    fn stable_seed_42_10_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 42);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node5", "node8", "node4", "node10", "node6", "node1"],
+            vec!["node3", "node7", "node6", "node8", "node4", "node5"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_123_10_nodes() {
+    fn stable_seed_123_10_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 123);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node5", "node1", "node3", "node2", "node9", "node4"],
+            vec!["node3", "node10", "node9", "node4", "node1", "node2"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_999_10_nodes() {
+    fn stable_seed_999_10_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 999);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node4", "node9", "node3", "node1", "node10", "node2"],
+            vec!["node2", "node7", "node1", "node4", "node3", "node9"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_0_10_nodes() {
+    fn stable_seed_0_10_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 0);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node4", "node1", "node10", "node9", "node5", "node7"],
+            vec!["node1", "node2", "node5", "node3", "node6", "node7"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_neg1_10_nodes() {
-        // Seed -1 as a u64 is 0xFFFF_FFFF_FFFF_FFFF; inside new_with_hash it's
-        // cast back to i64 = -1, matching Go's int64 seed semantics.
+    fn stable_seed_neg1_10_nodes() {
+        // Seed -1 as a u64 is 0xFFFF_FFFF_FFFF_FFFF; inside new_with_hash it is
+        // cast back to i64 = -1.
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), u64::MAX);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node10", "node4", "node1", "node2", "node5", "node9"],
+            vec!["node9", "node5", "node10", "node8", "node2", "node4"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_42_6_active_nodes() {
+    fn stable_seed_42_6_active_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(6), 42);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node6", "node3", "node1", "node4", "node2", "node5"],
+            vec!["node3", "node4", "node5", "node6", "node2", "node1"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_12345_10_nodes() {
+    fn stable_seed_12345_10_nodes() {
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), 12345);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node3", "node4", "node1", "node6", "node5", "node7"],
+            vec!["node5", "node6", "node1", "node9", "node7", "node10"],
         );
     }
 
     #[test]
-    fn cross_lang_seed_max_i64_10_nodes() {
+    fn stable_seed_max_i64_10_nodes() {
         // i64::MAX = 0x7FFF_FFFF_FFFF_FFFF — the largest positive int64.
         let plan = QueryPlan::new_with_hash(make_live_nodes(10), i64::MAX as u64);
         assert_eq!(
             sequence(&plan, 6),
-            vec!["node10", "node6", "node7", "node1", "node9", "node3"],
+            vec!["node9", "node10", "node4", "node6", "node7", "node3"],
         );
     }
 
