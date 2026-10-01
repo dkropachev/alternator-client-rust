@@ -14,9 +14,9 @@
 
 //! Header whitelist tests.
 //!
-//! This module verifies that the driver strips headers that Alternator does not
-//! use from outgoing requests. A proxy is used to intercept messages exchanged
-//! between the driver and Alternator.
+//! This module verifies the driver's compact unsigned-request header allowlist.
+//! A proxy is used to intercept messages exchanged between the driver and
+//! Alternator.
 //!
 //! There are eight test cases:
 //! 1. Without credentials:
@@ -27,14 +27,15 @@
 //!    verify that requests still follow the no-auth whitelist.
 //! 3. With per-request credentials:
 //!    Disable global credentials, provide credentials through a single SDK
-//!    operation override, prefer SigV4 auth, and verify that SigV4 headers are
-//!    preserved.
+//!    operation override, prefer SigV4 auth, and verify that the authorization
+//!    marker headers survive filtering. This does not validate the signature.
 //! 4. Without per-request credentials:
 //!    Disable global credentials, prefer SigV4 auth, and verify that a missing
 //!    per-request credentials override fails locally instead of being sent
 //!    unsigned.
 //! 5. With credentials:
-//!    Enable credentials and verify that requests follow this whitelist:
+//!    Enable credentials and verify that the optimized request follows this
+//!    whitelist (without asserting that its signature remains valid):
 //!    ["host", "x-amz-target", "content-length", "accept-encoding", "content-encoding", "user-agent", "authorization", "x-amz-date"]
 //! 6. Whitelist needed:
 //!    Enable credentials, disable header stripping, and verify that
@@ -351,7 +352,7 @@ pub async fn test_without_credentials_drops_injected_auth_headers(
 
 #[test_context(HttpTestContext<WithCredentialsConfig>)]
 #[tokio::test]
-pub async fn test_per_request_credentials_preserve_signed_headers(
+pub async fn test_per_request_credentials_keep_auth_markers(
     ctx: &mut HttpTestContext<WithCredentialsConfig>,
 ) {
     let client = AlternatorClient::from_conf(
