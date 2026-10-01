@@ -25,6 +25,7 @@ pub const DEFAULT_USER_AGENT: &str = concat!(
 type UserAgentTransform = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub enum UserAgent {
     #[default]
     Default,
