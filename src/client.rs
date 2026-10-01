@@ -888,10 +888,12 @@ mod tests {
                 HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
                 SharedHttpClient, SharedHttpConnector,
             },
-            orchestrator::HttpRequest,
+            orchestrator::{HttpRequest, HttpResponse},
             runtime_components::{RuntimeComponents, RuntimeComponentsBuilder},
         },
+        http::StatusCode,
     };
+    use aws_smithy_types::body::SdkBody;
     use aws_smithy_types::config_bag::ConfigBag;
     use itertools::Itertools;
 
@@ -1020,6 +1022,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct SuccessfulHttpClient(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl HttpClient for SuccessfulHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for SuccessfulHttpClient {
+        fn call(&self, _: HttpRequest) -> HttpConnectorFuture {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                StatusCode::try_from(200).unwrap(),
+                SdkBody::from(r#"{"TableNames":[]}"#),
+            )))
+        }
+    }
+
     #[derive(Debug)]
     struct RuntimeComponentsIdentityCache(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
@@ -1099,6 +1124,28 @@ mod tests {
                 .exactly_one()
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn removing_credentials_provider_restores_implicit_no_auth() {
+        let request_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .without_discovery()
+            .http_client(SuccessfulHttpClient(request_sent.clone()))
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .build();
+        let mut builder = config.to_builder();
+        builder.set_credentials_provider(None);
+
+        let client = AlternatorClient::try_from_conf(builder.build()).unwrap();
+        let result = client.list_tables().send().await;
+
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert!(request_sent.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

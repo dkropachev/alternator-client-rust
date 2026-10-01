@@ -1186,9 +1186,7 @@ impl AlternatorBuilder {
         &mut self,
         credentials_provider: Option<aws_sdk_dynamodb::config::SharedCredentialsProvider>,
     ) -> &mut Self {
-        if credentials_provider.is_some() {
-            self.alternator_ext.has_credentials_provider = true;
-        }
+        self.alternator_ext.has_credentials_provider = credentials_provider.is_some();
         self.dynamodb_builder
             .set_credentials_provider(credentials_provider);
         self
@@ -1286,6 +1284,21 @@ mod test {
             .build();
 
         assert!(config.has_credentials_provider());
+    }
+
+    #[test]
+    fn removing_credentials_provider_clears_the_provider_marker() {
+        let config = AlternatorConfig::builder()
+            .credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            )
+            .build();
+        let mut builder = config.to_builder();
+
+        builder.set_credentials_provider(None);
+        let rebuilt = builder.build();
+
+        assert!(!rebuilt.has_credentials_provider());
     }
 
     #[test]
