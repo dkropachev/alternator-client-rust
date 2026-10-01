@@ -15,13 +15,13 @@
 /// Small deterministic generator used to derive a stable affinity-node order
 /// from a partition-key hash.
 #[derive(Debug)]
-pub struct DeterministicRng {
+pub(crate) struct DeterministicRng {
     state: u64,
 }
 
 impl DeterministicRng {
     /// Creates a deterministic generator seeded with the given value.
-    pub fn new(seed: i64) -> Self {
+    pub(crate) fn new(seed: i64) -> Self {
         let state = match seed as u64 {
             0 => 0x9e37_79b9_7f4a_7c15,
             state => state,
@@ -43,7 +43,7 @@ impl DeterministicRng {
     /// # Panics
     ///
     /// Panics if `upper_bound` is zero.
-    pub fn index(&mut self, upper_bound: usize) -> usize {
+    pub(crate) fn index(&mut self, upper_bound: usize) -> usize {
         assert!(upper_bound > 0, "upper bound must be positive");
         ((self.next_u64() as u128 * upper_bound as u128) >> 64) as usize
     }

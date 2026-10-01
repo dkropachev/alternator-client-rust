@@ -18,12 +18,9 @@ use crate::load_balancing::cluster_utils::*;
 use crate::load_balancing::proxy;
 use crate::load_balancing::scope_utils;
 
-use alternator_driver::AlternatorClient;
-use alternator_driver::RoutingScope;
-use alternator_driver::keyrouting::affinity_config::{
-    KeyRouteAffinityConfig, KeyRouteAffinityType,
+use alternator_driver::{
+    AlternatorClient, KeyRouteAffinityConfig, KeyRouteAffinityType, RoutingScope,
 };
-use alternator_driver::keyrouting::{deterministic_rng::DeterministicRng, hasher};
 use aws_sdk_dynamodb::types::{
     AttributeAction, AttributeValue, AttributeValueUpdate, DeleteRequest, KeysAndAttributes,
     PutRequest, ReturnValue, Select, WriteRequest,
@@ -167,27 +164,40 @@ fn create_client_with_scope_and_affinity(
     )
 }
 
-fn expected_first_node<'a>(nodes: &'a [&str], partition_key_value: &str) -> &'a str {
-    let pk = AttributeValue::S(partition_key_value.to_string());
-    let hash = hasher::hash_attribute_value(&pk).unwrap();
-    let mut nodes = nodes.to_vec();
-    nodes.sort_unstable();
-
-    let mut rng = DeterministicRng::new(hash as i64);
-    let idx = rng.index(nodes.len());
-    nodes[idx]
-}
-
-fn find_two_keys_on_one_node_and_one_on_another(
+async fn find_two_keys_on_one_node_and_one_on_another(
+    client: &AlternatorClient,
+    request_counter: &RequestCounter,
     nodes: &[&str],
+    table_name: &str,
     key_prefix: &str,
 ) -> (String, String, String, String) {
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
 
     for i in 0..1000 {
         let key = format!("{key_prefix}_{i}");
-        let node = expected_first_node(nodes, &key).to_string();
+        request_counter.reset();
+        client
+            .put_item()
+            .table_name(table_name)
+            .item("id", s(&key))
+            .send()
+            .await
+            .expect("affinity probe write should succeed");
+        assert_eq!(
+            request_counter.total_posts(),
+            1,
+            "an affinity probe should issue exactly one POST",
+        );
+        let node = nodes
+            .iter()
+            .find(|node| request_counter.get(node).posts() == 1)
+            .expect("an affinity write should use exactly one node")
+            .to_string();
         buckets.entry(node).or_default().push(key);
+
+        if buckets.values().any(|keys| keys.len() >= 2) && buckets.len() >= 2 {
+            break;
+        }
     }
 
     let (majority_node, majority_keys) = buckets
@@ -508,7 +518,6 @@ async fn send_matrix_operation(
 fn assert_affinity_counts(
     request_counter: &RequestCounter,
     node_ips: &[&str],
-    expected_ip: &str,
     expected_requests: usize,
     case_label: &str,
 ) {
@@ -518,12 +527,13 @@ fn assert_affinity_counts(
         "{case_label}: unexpected total POST count"
     );
 
+    let selected_ip = node_ips
+        .iter()
+        .find(|ip| request_counter.get(ip).posts() == expected_requests)
+        .expect("all affinity requests should select one node");
+
     for ip in node_ips {
-        let expected = if *ip == expected_ip {
-            expected_requests
-        } else {
-            0
-        };
+        let expected = usize::from(ip == selected_ip) * expected_requests;
         assert_eq!(
             request_counter.get(ip).posts(),
             expected,
@@ -1269,11 +1279,9 @@ async fn key_route_affinity_operation_matrix_test() {
 
         match case.expected_routing {
             ExpectedRouting::Affinity => {
-                let expected_ip = expected_first_node(node_ips.as_slice(), &key);
                 assert_affinity_counts(
                     &request_counter,
                     node_ips.as_slice(),
-                    expected_ip,
                     node_ips.len(),
                     &case_label,
                 );
@@ -1317,8 +1325,14 @@ async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
     create_table(&client, &a_table_name).await;
     create_table(&client, &z_table_name).await;
 
-    let (a_key_1, a_key_2, z_key, expected_ip) =
-        find_two_keys_on_one_node_and_one_on_another(node_ips.as_slice(), "batch_multi_key");
+    let (a_key_1, a_key_2, z_key, expected_ip) = find_two_keys_on_one_node_and_one_on_another(
+        &client,
+        &request_counter,
+        node_ips.as_slice(),
+        &a_table_name,
+        "batch_multi_key",
+    )
+    .await;
 
     for z_table_first in [true, false] {
         request_counter.reset();
@@ -1361,10 +1375,10 @@ async fn batch_write_affinity_multitable_routing_is_deterministic_test() {
         assert_affinity_counts(
             &request_counter,
             node_ips.as_slice(),
-            &expected_ip,
             node_ips.len(),
             &case_label,
         );
+        assert_eq!(request_counter.get(&expected_ip).posts(), node_ips.len());
     }
 }
 
@@ -1411,8 +1425,5 @@ async fn affinity_deterministic_routing_test() {
             .unwrap();
 
         assert_eq!(request_counter.get_posts_to_other_ips(&[called_node_ip]), 0);
-
-        let expected_ip = expected_first_node(ips_in_scope.as_slice(), &item);
-        assert_eq!(*called_node_ip, expected_ip);
     }
 }
