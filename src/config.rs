@@ -27,7 +27,7 @@ pub(crate) struct AlternatorExtensions {
     pub(crate) response_compression: Option<ResponseCompression>,
     pub(crate) optimize_headers: Option<bool>,
     pub(crate) user_agent: Option<UserAgent>,
-    pub(crate) has_credentials_provider: bool,
+    pub(crate) credentials_provider: Option<aws_sdk_dynamodb::config::SharedCredentialsProvider>,
     pub(crate) require_auth: bool,
     pub(crate) allow_no_auth: bool,
     pub(crate) active_interval: Option<std::time::Duration>,
@@ -184,8 +184,10 @@ impl AlternatorConfig {
         self.alternator_ext.response_compression.clone()
     }
 
-    pub(crate) fn has_credentials_provider(&self) -> bool {
-        self.alternator_ext.has_credentials_provider
+    pub(crate) fn credentials_provider(
+        &self,
+    ) -> Option<aws_sdk_dynamodb::config::SharedCredentialsProvider> {
+        self.alternator_ext.credentials_provider.clone()
     }
 
     /// Returns whether this config requires every request to resolve credentials.
@@ -1172,24 +1174,32 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures the default credentials provider used to sign requests.
+    ///
+    /// SigV4 clients must also disable header optimization with
+    /// [`Self::optimize_headers(false)`](Self::optimize_headers).
     pub fn credentials_provider(
         mut self,
         credentials_provider: impl aws_sdk_dynamodb::config::ProvideCredentials + 'static,
     ) -> Self {
-        self.alternator_ext.has_credentials_provider = true;
-        self.dynamodb_builder = self
-            .dynamodb_builder
-            .credentials_provider(credentials_provider);
+        self.alternator_ext.credentials_provider = Some(
+            aws_sdk_dynamodb::config::SharedCredentialsProvider::new(credentials_provider),
+        );
         self
     }
 
+    /// Sets or removes the default credentials provider.
+    ///
+    /// Passing `None` removes a previously configured provider. Unless
+    /// [`require_auth`](Self::require_auth) is enabled, clients built from the
+    /// resulting configuration permit unsigned requests automatically.
+    /// SigV4 clients must also disable header optimization with
+    /// [`Self::optimize_headers(false)`](Self::optimize_headers).
     pub fn set_credentials_provider(
         &mut self,
         credentials_provider: Option<aws_sdk_dynamodb::config::SharedCredentialsProvider>,
     ) -> &mut Self {
-        self.alternator_ext.has_credentials_provider = credentials_provider.is_some();
-        self.dynamodb_builder
-            .set_credentials_provider(credentials_provider);
+        self.alternator_ext.credentials_provider = credentials_provider;
         self
     }
 }
@@ -1284,7 +1294,7 @@ mod test {
             )
             .build();
 
-        assert!(config.has_credentials_provider());
+        assert!(config.credentials_provider().is_some());
     }
 
     #[test]
@@ -1299,7 +1309,7 @@ mod test {
         builder.set_credentials_provider(None);
         let rebuilt = builder.build();
 
-        assert!(!rebuilt.has_credentials_provider());
+        assert!(rebuilt.credentials_provider().is_none());
     }
 
     #[test]

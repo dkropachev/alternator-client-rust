@@ -383,10 +383,15 @@ impl AlternatorClient {
         let response_compression = extensions.response_compression.unwrap_or_default();
         let optimize_headers = extensions.optimize_headers.unwrap_or(true);
         let user_agent = extensions.user_agent.unwrap_or_default();
-        let has_credentials_provider = config.has_credentials_provider();
+        let credentials_provider = config.credentials_provider();
+        let has_credentials_provider = credentials_provider.is_some();
         let has_region = dynamodb_config.region().is_some();
 
         let mut builder = dynamodb_config.to_builder();
+
+        if let Some(credentials_provider) = credentials_provider {
+            builder.set_credentials_provider(Some(credentials_provider));
+        }
 
         if !has_credentials_provider && !config.requires_auth() && !config.allows_no_auth() {
             builder = builder.allow_no_auth();
@@ -1022,8 +1027,16 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct CapturedRequest {
+        calls: std::sync::atomic::AtomicUsize,
+        authorization: std::sync::atomic::AtomicBool,
+        amz_date: std::sync::atomic::AtomicBool,
+        security_token: std::sync::atomic::AtomicBool,
+    }
+
     #[derive(Clone, Debug)]
-    struct SuccessfulHttpClient(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    struct SuccessfulHttpClient(std::sync::Arc<CapturedRequest>);
 
     impl HttpClient for SuccessfulHttpClient {
         fn http_connector(
@@ -1036,13 +1049,72 @@ mod tests {
     }
 
     impl HttpConnector for SuccessfulHttpClient {
-        fn call(&self, _: HttpRequest) -> HttpConnectorFuture {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.0
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.authorization.store(
+                request.headers().contains_key("authorization"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.0.amz_date.store(
+                request.headers().contains_key("x-amz-date"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.0.security_token.store(
+                request.headers().contains_key("x-amz-security-token"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             HttpConnectorFuture::ready(Ok(HttpResponse::new(
                 StatusCode::try_from(200).unwrap(),
                 SdkBody::from(r#"{"TableNames":[]}"#),
             )))
         }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountingCredentialsProvider(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl aws_credential_types::provider::ProvideCredentials for CountingCredentialsProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            aws_credential_types::provider::future::ProvideCredentials::ready(Ok(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            ))
+        }
+    }
+
+    fn removable_credentials_builder(
+        captured: std::sync::Arc<CapturedRequest>,
+        provider_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> AlternatorBuilder {
+        AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .without_discovery()
+            .optimize_headers(false)
+            .http_client(SuccessfulHttpClient(captured))
+            .credentials_provider(CountingCredentialsProvider(provider_calls))
+    }
+
+    fn assert_unsigned_request(captured: &CapturedRequest) {
+        assert_eq!(captured.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !captured
+                .authorization
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(!captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !captured
+                .security_token
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[derive(Debug)]
@@ -1127,17 +1199,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removing_credentials_provider_restores_implicit_no_auth() {
-        let request_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let config = AlternatorConfig::builder()
-            .seed_hosts(["127.0.0.1"])
-            .port(8000)
-            .without_discovery()
-            .http_client(SuccessfulHttpClient(request_sent.clone()))
-            .credentials_provider(
-                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
-            )
-            .build();
+    async fn removing_credentials_provider_from_rebuilt_config_sends_unsigned() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config =
+            removable_credentials_builder(captured.clone(), provider_calls.clone()).build();
         let mut builder = config.to_builder();
         builder.set_credentials_provider(None);
 
@@ -1145,7 +1211,75 @@ mod tests {
         let result = client.list_tables().send().await;
 
         assert!(result.is_ok(), "request failed: {result:?}");
-        assert!(request_sent.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_unsigned_request(&captured);
+    }
+
+    #[tokio::test]
+    async fn removing_credentials_provider_from_same_builder_sends_unsigned() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = removable_credentials_builder(captured.clone(), provider_calls.clone());
+        builder.set_credentials_provider(None);
+
+        let client = AlternatorClient::try_from_conf(builder.build()).unwrap();
+        let result = client.list_tables().send().await;
+
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_unsigned_request(&captured);
+    }
+
+    #[tokio::test]
+    async fn require_auth_after_removing_credentials_fails_before_transport() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = removable_credentials_builder(captured.clone(), provider_calls.clone());
+        builder
+            .set_credentials_provider(None)
+            .set_require_auth(true);
+
+        let client = AlternatorClient::try_from_conf(builder.build()).unwrap();
+        let result = client.list_tables().send().await;
+
+        assert!(result.is_err());
+        assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(captured.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn per_request_credentials_work_after_removing_default_credentials() {
+        let captured = std::sync::Arc::new(CapturedRequest::default());
+        let provider_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = removable_credentials_builder(captured.clone(), provider_calls.clone());
+        builder
+            .set_credentials_provider(None)
+            .set_require_auth(true);
+
+        let client = AlternatorClient::try_from_conf(builder.build()).unwrap();
+        let result = client
+            .list_tables()
+            .customize()
+            .config_override(aws_sdk_dynamodb::Config::builder().credentials_provider(
+                aws_sdk_dynamodb::config::Credentials::for_tests_with_session_token(),
+            ))
+            .send()
+            .await;
+
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert_eq!(provider_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(captured.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            captured
+                .authorization
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            captured
+                .security_token
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]
