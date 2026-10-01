@@ -135,13 +135,17 @@ impl AlternatorConfig {
         }
     }
 
-    /// Before sending each request, strip headers that Alternator does not use
-    /// from the request.
+    /// Before sending each request, apply the compact header allowlist intended
+    /// for unsigned requests.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside these headers after this happens.
+    ///
+    /// Header optimization is incompatible with SigV4 because it runs after
+    /// signing and may remove headers named by `SignedHeaders`. SigV4 clients
+    /// must set this to `false`.
     ///
     /// Turned on by default.
     pub fn optimize_headers(&self) -> Option<bool> {
@@ -415,12 +419,17 @@ impl AlternatorBuilder {
         }
     }
 
-    /// Before sending each request, strip the headers from them which are not used by the Alternator.
+    /// Before sending each request, apply the compact header allowlist intended
+    /// for unsigned requests.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside these headers after this happens.
+    ///
+    /// Header optimization is incompatible with SigV4 because it runs after
+    /// signing and may remove headers named by `SignedHeaders`. SigV4 clients
+    /// must set this to `false`.
     ///
     /// Turned on by default.
     pub fn optimize_headers(mut self, optimize: bool) -> Self {
@@ -428,14 +437,10 @@ impl AlternatorBuilder {
         self
     }
 
-    /// Before sending each request, strip the headers from them which are not used by the Alternator.
+    /// Sets whether to strip headers before transmission.
     ///
-    /// This is done by an interceptor in `modify_before_transmit` hook.
-    ///
-    /// Take note, that this may break your own interceptors,
-    /// if they happened to look inside these headers after this happens.
-    ///
-    /// Turned on by default.
+    /// See [`Self::optimize_headers`] for SigV4 restrictions. This setting is
+    /// on by default.
     pub fn set_optimize_headers(&mut self, optimize: bool) -> &mut Self {
         self.alternator_ext.optimize_headers = Some(optimize);
         self

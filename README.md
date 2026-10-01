@@ -95,6 +95,10 @@ When no credentials provider is configured, `AlternatorClient` enables no-auth a
 
 Alternator supports no-auth and SigV4 signing through configured or per-request credentials. Custom AWS SDK auth schemes, auth scheme preferences, and auth scheme resolvers are not exposed. Use `allow_no_auth()` when you want to make unsigned access explicit. Use `require_auth()` when a client without default credentials should require signed per-request credentials instead of falling back to no-auth.
 
+[ScyllaDB's Alternator authentication documentation](https://docs.scylladb.com/manual/stable/alternator/compatibility.html#authentication-and-authorization) explains how to enable request validation with `alternator_enforce_authorization: true`. Alternator uses CQL role credentials rather than AWS IAM credentials: the role name is the access key ID and its `salted_hash` is the secret access key.
+
+For version 0.1, SigV4 clients must set `.optimize_headers(false)`. Header optimization runs after AWS SDK signing and can remove headers named by `SignedHeaders`; [Alternator's verifier reconstructs and validates every signed header](https://github.com/scylladb/scylladb/blob/942e15ba0173594b919849a42590550c338c6731/alternator/server.cc#L303-L454), so an optimized signed request can be rejected. Unsigned clients can keep the default optimization.
+
 This client targets ScyllaDB Alternator. It does not guarantee that Alternator-specific configuration, no-auth defaults, or request optimizations remain compatible with AWS DynamoDB itself.
 
 ### Supported configuration surface
@@ -105,8 +109,8 @@ There is no `AlternatorClient::new(&SdkConfig)`, `AlternatorConfig::new(&SdkConf
 
 Supported auth modes are:
 - no-auth, enabled automatically when no credentials provider is configured, or explicitly with `allow_no_auth()`
-- SigV4 with a credentials provider configured through `credentials_provider(...)`
-- SigV4 with per-request credentials, usually with a client built using `require_auth()`
+- SigV4 with a credentials provider configured through `credentials_provider(...)` and header optimization disabled
+- SigV4 with per-request credentials, usually with a client built using `require_auth()`, and header optimization disabled
 
 The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth scheme preferences, account ID endpoint mode, FIPS endpoints, dual-stack endpoints, custom endpoint resolvers, or an SDK `endpoint_url(...)` builder setter. These APIs are intentionally absent rather than accepted and ignored. Use the Alternator-specific `scheme(...)`, `port(...)`, and `seed_hosts(...)` settings for discovery and client-side routing; the SDK endpoint follows from them. Use `user_agent(...)` for Alternator client identification.
 
@@ -425,7 +429,7 @@ let client = AlternatorClient::from_conf(
 
 ## Header stripping
 
-By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required for signed requests (`Host`, `Authorization`, `X-Amz-Date`, etc.), others are SDK metadata that Alternator doesn't use (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate strips non-essential headers before transmission, then writes the configured final `User-Agent`. Optimized requests keep only:
+By default, the AWS Rust SDK attaches a number of headers to every DynamoDB request — some are required for signed requests (`Host`, `Authorization`, `X-Amz-Date`, etc.), while others are SDK metadata that unsigned requests do not need (`User-Agent` flavors, internal telemetry, retry information). For a small client-side optimization, this crate applies a compact allowlist before transmission, then writes the configured final `User-Agent`. Optimized requests keep only:
 - `host`
 - `x-amz-target`
 - `content-length`
@@ -433,19 +437,30 @@ By default, the AWS Rust SDK attaches a number of headers to every DynamoDB requ
 - `content-encoding`
 - `user-agent` unless disabled with `without_user_agent()`
 
-For signed requests, it also keeps:
+When a request is signed, the optimizer also keeps:
 - `authorization`
 - `x-amz-date`
 
-This is on by default, you can disable it if needed:
+This allowlist is intended for unsigned Alternator requests. It does not retain every header that the AWS SDK may include in `SignedHeaders`, so preserving only `authorization` and `x-amz-date` is not enough to keep a signature valid. Disable header optimization for every SigV4 client:
 
 ```rust
 use alternator_driver::{AlternatorConfig, AlternatorClient};
+use aws_sdk_dynamodb::config::Credentials;
+
+let credentials = Credentials::new(
+    std::env::var("ALTERNATOR_ACCESS_KEY_ID").unwrap(),
+    std::env::var("ALTERNATOR_SECRET_ACCESS_KEY").unwrap(),
+    None,
+    None,
+    "Alternator",
+);
 
 let client = AlternatorClient::from_conf(
     AlternatorConfig::builder()
-        .seed_hosts(["10.0.0.1"])
+        .scheme("https")
+        .seed_hosts(["alternator.example.com"])
         .port(8043)
+        .credentials_provider(credentials)
         .optimize_headers(false)
         .build(),
 );
