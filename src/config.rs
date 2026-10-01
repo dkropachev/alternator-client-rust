@@ -135,17 +135,16 @@ impl AlternatorConfig {
         }
     }
 
-    /// Before sending each request, apply the compact header allowlist intended
-    /// for unsigned requests.
+    /// Before sending each request, apply the compact header allowlist.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside these headers after this happens.
     ///
-    /// Signed requests retain the headers used by the pinned AWS DynamoDB
-    /// SDK's SigV4 implementation. Because optimization runs after signing,
-    /// clients that add custom signed headers must set this to `false`.
+    /// Signed requests retain every header named by the actual SigV4
+    /// `SignedHeaders` value, including custom headers added before signing. If
+    /// the authorization format cannot be parsed, the request is left intact.
     ///
     /// Turned on by default.
     pub fn optimize_headers(&self) -> Option<bool> {
@@ -421,17 +420,16 @@ impl AlternatorBuilder {
         }
     }
 
-    /// Before sending each request, apply the compact header allowlist intended
-    /// for unsigned requests.
+    /// Before sending each request, apply the compact header allowlist.
     ///
     /// This is done by an interceptor in `modify_before_transmit` hook.
     ///
     /// Take note, that this may break your own interceptors,
     /// if they happened to look inside these headers after this happens.
     ///
-    /// Signed requests retain the headers used by the pinned AWS DynamoDB
-    /// SDK's SigV4 implementation. Because optimization runs after signing,
-    /// clients that add custom signed headers must set this to `false`.
+    /// Signed requests retain every header named by the actual SigV4
+    /// `SignedHeaders` value, including custom headers added before signing. If
+    /// the authorization format cannot be parsed, the request is left intact.
     ///
     /// Turned on by default.
     pub fn optimize_headers(mut self, optimize: bool) -> Self {
@@ -1176,8 +1174,8 @@ impl AlternatorBuilder {
 
     /// Configures the default credentials provider used to sign requests.
     ///
-    /// When header optimization is enabled, the driver's authenticated
-    /// allowlist is selected automatically.
+    /// When header optimization is enabled, protected headers are derived from
+    /// the request's actual SigV4 `SignedHeaders` value.
     pub fn credentials_provider(
         mut self,
         credentials_provider: impl aws_sdk_dynamodb::config::ProvideCredentials + 'static,
@@ -1193,8 +1191,8 @@ impl AlternatorBuilder {
     /// Passing `None` removes a previously configured provider. Unless
     /// [`require_auth`](Self::require_auth) is enabled, clients built from the
     /// resulting configuration permit unsigned requests automatically.
-    /// When header optimization is enabled, the driver's authenticated
-    /// allowlist is selected automatically.
+    /// When header optimization is enabled, protected headers are derived from
+    /// the request's actual SigV4 `SignedHeaders` value.
     pub fn set_credentials_provider(
         &mut self,
         credentials_provider: Option<aws_sdk_dynamodb::config::SharedCredentialsProvider>,
