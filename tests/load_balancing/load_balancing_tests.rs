@@ -23,7 +23,7 @@ use alternator_driver::RoutingScope;
 use alternator_driver::keyrouting::affinity_config::{
     KeyRouteAffinityConfig, KeyRouteAffinityType,
 };
-use alternator_driver::keyrouting::{go_rand::GoRand, hasher};
+use alternator_driver::keyrouting::{deterministic_rng::DeterministicRng, hasher};
 use aws_sdk_dynamodb::types::{
     AttributeAction, AttributeValue, AttributeValueUpdate, DeleteRequest, KeysAndAttributes,
     PutRequest, ReturnValue, Select, WriteRequest,
@@ -173,8 +173,8 @@ fn expected_first_node<'a>(nodes: &'a [&str], partition_key_value: &str) -> &'a 
     let mut nodes = nodes.to_vec();
     nodes.sort_unstable();
 
-    let mut rng = GoRand::new(hash as i64);
-    let idx = rng.intn(nodes.len() as i32) as usize;
+    let mut rng = DeterministicRng::new(hash as i64);
+    let idx = rng.index(nodes.len());
     nodes[idx]
 }
 

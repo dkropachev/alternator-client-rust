@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-// Constants mapping to the Java implementation
+// Retry and cooldown constants for asynchronous partition-key discovery.
 const MAX_RETRIES: u32 = 3;
 const INITIAL_RETRY_DELAY_MS: u64 = 100;
 const MAX_RETRY_DELAY_MS: u64 = 2000;
@@ -45,7 +45,7 @@ impl FailureRecord {
     }
 }
 
-/// Resolves partition key attribute names for DynamoDB tables, mirroring the Java implementation.
+/// Resolves partition key attribute names for DynamoDB tables.
 ///
 /// Caches results to avoid repeated `DescribeTable` calls. Supports both
 /// pre-configured partition key info (via [`PartitionKeyResolver::new`]) and
