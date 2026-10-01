@@ -245,6 +245,8 @@ fn test_builder() {
     with_exceptions.remove(&(None, "behavior_version".into())); // pinned by the driver itself, see ALTERNATOR_BEHAVIOR_VERSION
     with_exceptions.remove(&(None, "set_behavior_version".into()));
     with_exceptions.remove(&(None, "behavior_version_latest".into()));
+    with_exceptions.remove(&(None, "endpoint_url".into())); // seed_hosts/scheme/port are the only routing configuration, and the SDK endpoint follows from them
+    with_exceptions.remove(&(None, "set_endpoint_url".into()));
 
     let unimplemented = with_exceptions.difference(&alternator_builder_methods);
     let all_implemented = unimplemented.clone().next().is_none();

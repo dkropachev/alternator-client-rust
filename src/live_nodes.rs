@@ -128,15 +128,14 @@ pub(crate) enum LiveNodesBuildError {
 impl std::fmt::Display for LiveNodesBuildError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingRoutingTarget => formatter.write_str(
-                "no Alternator routing target configured; set endpoint_url or non-empty seed_hosts",
-            ),
+            Self::MissingRoutingTarget => formatter
+                .write_str("no Alternator routing target configured; set non-empty seed_hosts"),
             Self::InvalidSeedHost { seed_host, source } => {
                 write!(formatter, "invalid seed host {seed_host:?}: {source}")
             }
             Self::InvalidScheme(scheme) => write!(
                 formatter,
-                "invalid Alternator transport scheme {scheme:?}: expected http or https"
+                "invalid Alternator transport scheme {scheme:?}: expected http or https, or a valid custom URI scheme for direct routing with a custom HTTP client"
             ),
             Self::TlsConfiguration(message) => {
                 write!(formatter, "failed to configure discovery TLS: {message}")
@@ -444,8 +443,9 @@ impl Drop for DiscoveryTaskGuard {
 impl LiveNodes {
     /// Creates discovery state from the configured seed hosts.
     ///
-    /// Returns [`None`] when an SDK endpoint URL is configured and discovery is
-    /// explicitly disabled with an empty seed-host list.
+    /// Returns [`None`] when discovery is turned off with
+    /// [`AlternatorBuilder::without_discovery`](crate::config::AlternatorBuilder::without_discovery),
+    /// in which case requests go straight to the first seed host.
     ///
     /// # Panics
     ///
@@ -476,22 +476,27 @@ impl LiveNodes {
         let Some(seed_nodes) = config.seed_hosts() else {
             return Err(LiveNodesBuildError::MissingRoutingTarget);
         };
+        let Some(first_seed) = seed_nodes.first() else {
+            return Err(LiveNodesBuildError::MissingRoutingTarget);
+        };
 
-        if seed_nodes.is_empty() {
-            let Some(endpoint_url) = config.endpoint_url() else {
-                return Err(LiveNodesBuildError::MissingRoutingTarget);
-            };
-            if config.http_client().is_none() {
-                let endpoint = Url::parse(endpoint_url)
-                    .map_err(|_| LiveNodesBuildError::MissingRoutingTarget)?;
-                if !endpoint.scheme().eq_ignore_ascii_case("http")
-                    && !endpoint.scheme().eq_ignore_ascii_case("https")
-                {
-                    return Err(LiveNodesBuildError::InvalidScheme(
-                        endpoint.scheme().to_string(),
-                    ));
-                }
+        if config.without_discovery() {
+            // Requests go to the seed host itself, so it has to be a usable
+            // target even though nothing is discovered through it. A custom
+            // HTTP client may speak a scheme this driver does not know.
+            if !is_valid_uri_scheme(&alternator_scheme)
+                || (config.http_client().is_none()
+                    && !alternator_scheme.eq_ignore_ascii_case("http")
+                    && !alternator_scheme.eq_ignore_ascii_case("https"))
+            {
+                return Err(LiveNodesBuildError::InvalidScheme(alternator_scheme));
             }
+            build_seed_url(&alternator_scheme, first_seed, port).map_err(|source| {
+                LiveNodesBuildError::InvalidSeedHost {
+                    seed_host: first_seed.clone(),
+                    source,
+                }
+            })?;
             return Ok(None);
         }
 
@@ -883,7 +888,11 @@ impl LiveNodes {
     }
 }
 
-fn build_seed_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
+pub(crate) fn build_seed_url(
+    scheme: &str,
+    addr: &str,
+    port: Option<u16>,
+) -> Result<Url, url::ParseError> {
     let unbracketed = addr
         .strip_prefix('[')
         .and_then(|addr| addr.strip_suffix(']'))
@@ -894,7 +903,23 @@ fn build_seed_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, ur
     build_node_url(scheme, unbracketed, port)
 }
 
+/// Whether `scheme` is a syntactically valid bare URI scheme.
+///
+/// Validate before calling [`Url::parse`]. WHATWG URL parsing strips ASCII
+/// tabs, newlines, carriage returns, and surrounding control characters, so
+/// relying on it alone could silently turn malformed input into another valid
+/// transport scheme.
+fn is_valid_uri_scheme(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
 fn build_node_url(scheme: &str, addr: &str, port: Option<u16>) -> Result<Url, url::ParseError> {
+    if !is_valid_uri_scheme(scheme) {
+        return Err(url::ParseError::RelativeUrlWithoutBase);
+    }
     let authority = if addr.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{addr}]")
     } else {
@@ -966,7 +991,8 @@ mod tests {
 
     fn test_config() -> AlternatorConfig {
         AlternatorConfig::builder()
-            .endpoint_url("http://127.0.0.1:1".to_string())
+            .seed_hosts(["127.0.0.1"])
+            .port(1)
             .build()
     }
 
@@ -1081,7 +1107,8 @@ mod tests {
     fn discovery_restarts_after_its_runtime_is_dropped() {
         let (port, request_count, server) = start_runtime_restart_server();
         let config = AlternatorConfig::builder()
-            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .seed_hosts(["127.0.0.1"])
+            .port(port)
             .active_interval(Duration::from_secs(60 * 60))
             .idle_interval(Duration::from_secs(60 * 60))
             .build();
@@ -1151,7 +1178,8 @@ mod tests {
     fn first_access_hands_discovery_off_after_background_runtime_shutdown() {
         let (port, request_count, server) = start_runtime_restart_server();
         let config = AlternatorConfig::builder()
-            .endpoint_url(format!("http://127.0.0.1:{port}"))
+            .seed_hosts(["127.0.0.1"])
+            .port(port)
             .active_interval(Duration::from_secs(60 * 60))
             .idle_interval(Duration::from_secs(60 * 60))
             .build();
@@ -1657,10 +1685,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_seed_hosts_with_an_endpoint_disable_discovery() {
+    fn without_discovery_disables_discovery() {
         let config = AlternatorConfig::builder()
-            .endpoint_url("http://127.0.0.1:8000")
-            .seed_hosts(Vec::<String>::new())
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .without_discovery()
             .build();
 
         assert!(LiveNodes::try_new(&config).unwrap().is_none());
@@ -1668,47 +1697,119 @@ mod tests {
     }
 
     #[test]
-    fn direct_endpoint_validation_uses_the_endpoint_scheme() {
-        for (endpoint, discovery_scheme, expected_scheme) in
-            [("ftp://host", "http", "ftp"), ("ws://host", "https", "ws")]
-        {
+    fn direct_routing_validates_the_configured_scheme() {
+        for unsupported_scheme in ["ftp", "ws", "https://dynamodb.us-east-1.amazonaws.com/x"] {
             let config = AlternatorConfig::builder()
-                .endpoint_url(endpoint)
-                .seed_hosts(Vec::<String>::new())
-                .scheme(discovery_scheme)
+                .seed_hosts(["host"])
+                .without_discovery()
+                .scheme(unsupported_scheme)
                 .build();
 
             assert!(matches!(
                 LiveNodes::try_new(&config),
                 Err(LiveNodesBuildError::InvalidScheme(scheme))
-                    if scheme == expected_scheme
+                    if scheme == unsupported_scheme
             ));
             assert!(crate::AlternatorClient::try_from_conf(config).is_err());
         }
 
         let direct_http = AlternatorConfig::builder()
-            .endpoint_url("http://host")
-            .seed_hosts(Vec::<String>::new())
-            .scheme("ftp")
+            .seed_hosts(["host"])
+            .without_discovery()
+            .scheme("https")
             .build();
         assert!(LiveNodes::try_new(&direct_http).unwrap().is_none());
         assert!(crate::AlternatorClient::try_from_conf(direct_http).is_ok());
     }
 
     #[test]
-    fn custom_http_client_defers_direct_scheme_validation() {
-        let config = AlternatorConfig::builder()
-            .endpoint_url("custom://host")
-            .seed_hosts(Vec::<String>::new())
-            .http_client(aws_smithy_http_client::Builder::new().build_http())
-            .build();
-
-        assert!(LiveNodes::try_new(&config).unwrap().is_none());
-        assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
+    fn without_discovery_needs_a_seed_host() {
+        for config in [
+            AlternatorConfig::builder().without_discovery().build(),
+            AlternatorConfig::builder()
+                .seed_hosts(Vec::<String>::new())
+                .without_discovery()
+                .build(),
+        ] {
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::MissingRoutingTarget)
+            ));
+        }
     }
 
     #[test]
-    fn missing_seed_hosts_and_endpoint_are_rejected() {
+    fn custom_http_client_supports_valid_direct_schemes() {
+        for (configured, stored, endpoint) in [
+            ("custom", "custom", "custom://host"),
+            ("CUSTOM", "CUSTOM", "custom://host"),
+            ("a+b.c-1", "a+b.c-1", "a+b.c-1://host"),
+            ("custom:", "custom", "custom://host"),
+            ("custom://", "custom", "custom://host"),
+        ] {
+            let config = AlternatorConfig::builder()
+                .scheme(configured)
+                .seed_hosts(["host"])
+                .without_discovery()
+                .http_client(aws_smithy_http_client::Builder::new().build_http())
+                .build();
+
+            assert_eq!(config.scheme().as_deref(), Some(stored));
+            assert_eq!(config.endpoint_url().as_deref(), Some(endpoint));
+            assert!(LiveNodes::try_new(&config).unwrap().is_none());
+            assert!(crate::AlternatorClient::try_from_conf(config).is_ok());
+        }
+    }
+
+    #[test]
+    fn custom_http_client_does_not_allow_malformed_direct_schemes() {
+        for malformed in [
+            "\nhttp",
+            "ht\ntp",
+            "\0http",
+            "http\t",
+            "1custom",
+            "+custom",
+            "éhttp",
+            "http::",
+            "http:/",
+            "http///",
+            "http:://",
+            "https://dynamodb.us-east-1.amazonaws.com/x",
+        ] {
+            let config = AlternatorConfig::builder()
+                .scheme(malformed)
+                .seed_hosts(["host"])
+                .without_discovery()
+                .http_client(aws_smithy_http_client::Builder::new().build_http())
+                .build();
+
+            assert_eq!(config.endpoint_url(), None, "accepted {malformed:?}");
+            assert!(matches!(
+                LiveNodes::try_new(&config),
+                Err(LiveNodesBuildError::InvalidScheme(_))
+            ));
+            assert!(crate::AlternatorClient::try_from_conf(config).is_err());
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_custom_schemes_even_with_a_custom_http_client() {
+        let config = AlternatorConfig::builder()
+            .scheme("custom")
+            .seed_hosts(["host"])
+            .http_client(aws_smithy_http_client::Builder::new().build_http())
+            .build();
+
+        assert!(matches!(
+            LiveNodes::try_new(&config),
+            Err(LiveNodesBuildError::InvalidScheme(scheme)) if scheme == "custom"
+        ));
+        assert!(crate::AlternatorClient::try_from_conf(config).is_err());
+    }
+
+    #[test]
+    fn missing_seed_hosts_are_rejected() {
         let config = AlternatorConfig::builder().build();
 
         assert!(matches!(
@@ -1767,7 +1868,9 @@ mod tests {
     #[test]
     fn ipv6_address_parsing() {
         let config = AlternatorConfig::builder()
-            .endpoint_url("http://[::1]:8000".to_string())
+            .scheme("http")
+            .port(8000)
+            .seed_hosts(["::1"])
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
         assert_eq!(nodes.seed_urls[0].scheme(), "http");
