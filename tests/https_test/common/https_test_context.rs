@@ -28,6 +28,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1::SendRequest;
 use hyper::{Request, Response};
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -80,14 +81,15 @@ static FIXTURE: std::sync::LazyLock<Fixture> = std::sync::LazyLock::new(|| {
     }
 });
 
-fn write_ca_and_set_env(ca_pem: &str) -> PathBuf {
+fn write_ca_and_set_env(ca_pem: &str) -> (PathBuf, Option<OsString>) {
     let path = std::env::temp_dir().join(format!("https_test_ca_{}.pem", Uuid::new_v4()));
     std::fs::write(&path, ca_pem).unwrap();
+    let previous_cert_file = std::env::var_os("SSL_CERT_FILE");
     // SAFETY: These HTTPS tests are marked `#[serial]` and use Tokio's
     // `current_thread` runtime, so this test process runs only one of these
     // env-mutating test contexts at a time during setup/teardown.
     unsafe { std::env::set_var("SSL_CERT_FILE", &path) };
-    path
+    (path, previous_cert_file)
 }
 
 type OnRequest = Box<
@@ -104,11 +106,12 @@ pub struct HttpsTestContext {
     proxy_handle: JoinHandle<()>,
     proxy_address: String,
     cert_path: PathBuf,
+    previous_cert_file: Option<OsString>,
 }
 
 impl AsyncTestContext for HttpsTestContext {
     async fn setup() -> Self {
-        let cert_path = write_ca_and_set_env(&FIXTURE.ca_pem);
+        let (cert_path, previous_cert_file) = write_ca_and_set_env(&FIXTURE.ca_pem);
 
         let initial: OnRequest =
             Box::new(|request, sender| forward_on_request(request, sender).boxed());
@@ -139,6 +142,7 @@ impl AsyncTestContext for HttpsTestContext {
             proxy_handle,
             proxy_address,
             cert_path,
+            previous_cert_file,
         }
     }
 
@@ -148,7 +152,12 @@ impl AsyncTestContext for HttpsTestContext {
         // SAFETY: These HTTPS tests are marked `#[serial]` and use Tokio's
         // `current_thread` runtime, so this test process runs only one of these
         // env-mutating test contexts at a time during setup/teardown.
-        unsafe { std::env::remove_var("SSL_CERT_FILE") };
+        unsafe {
+            match self.previous_cert_file {
+                Some(value) => std::env::set_var("SSL_CERT_FILE", value),
+                None => std::env::remove_var("SSL_CERT_FILE"),
+            }
+        }
     }
 }
 
@@ -186,5 +195,22 @@ impl HttpsTestContext {
             .1
             .parse()
             .expect("proxy address port is numeric")
+    }
+
+    /// Generated CA certificate, for configuring a custom HTTPS client.
+    pub fn get_ca_pem(&self) -> Vec<u8> {
+        FIXTURE.ca_pem.as_bytes().to_vec()
+    }
+
+    /// Removes the fixture's native-root override so only explicitly configured
+    /// clients can trust its generated CA.
+    pub fn remove_ca_from_native_roots(&self) {
+        assert_eq!(
+            std::env::var_os("SSL_CERT_FILE").as_deref(),
+            Some(self.cert_path.as_os_str()),
+            "HTTPS fixture no longer owns SSL_CERT_FILE"
+        );
+        // SAFETY: HTTPS tests are serial and use a current-thread runtime.
+        unsafe { std::env::remove_var("SSL_CERT_FILE") };
     }
 }
