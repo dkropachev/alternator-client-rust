@@ -30,16 +30,6 @@
 //! since DynamoDB partitions data by partition key only. The sort key determines ordering within a
 //! partition but does not affect which node stores the data.
 //!
-//! Example for a table with composite key (user_id, timestamp):
-//!
-//! ```rust
-//! // Only hash the partition key (user_id)
-//! use alternator_driver::keyrouting::hasher::hash_attribute_value;
-//! use aws_sdk_dynamodb::types::AttributeValue;
-//! let partition_key = AttributeValue::S("user_123".to_string());
-//! let hash = hash_attribute_value(&partition_key);
-//! ```
-//!
 //! # Number Representation
 //!
 //! Number values (N type) are hashed using their exact string representation as stored in
@@ -77,7 +67,7 @@ const TYPE_NUMBER: u8 = 0x02;
 const TYPE_BINARY: u8 = 0x03;
 
 /// Computes the affinity hash for a DynamoDB `AttributeValue` partition key.
-pub fn hash_attribute_value(value: &AttributeValue) -> Option<u64> {
+pub(crate) fn hash_attribute_value(value: &AttributeValue) -> Option<u64> {
     let (prefix, bytes): (u8, &[u8]) = match value {
         AttributeValue::S(s) => (TYPE_STRING, s.as_bytes()),
         AttributeValue::N(n) => (TYPE_NUMBER, n.as_bytes()),

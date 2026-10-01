@@ -18,7 +18,7 @@ mod config;
 mod customize;
 mod decompression;
 mod interceptors;
-pub mod keyrouting;
+mod keyrouting;
 mod live_nodes;
 mod optimize_headers;
 mod query_plan;

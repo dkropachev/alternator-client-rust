@@ -12,13 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod affinity_config;
+pub(crate) mod affinity_config;
 pub(crate) mod classifier;
-// Expose for integration tests.
-#[doc(hidden)]
-pub mod deterministic_rng;
-#[doc(hidden)]
-pub mod hasher;
+pub(crate) mod deterministic_rng;
+pub(crate) mod hasher;
 pub(crate) mod resolver;
 
 pub use affinity_config::{KeyRouteAffinityConfig, KeyRouteAffinityType};
