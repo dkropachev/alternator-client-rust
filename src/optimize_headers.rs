@@ -20,20 +20,26 @@ use aws_smithy_runtime_api::http::Request;
 pub(crate) fn strip_headers(request: &mut Request, preserve_auth_headers: bool) {
     let headers = request.headers_mut();
 
-    const WHITELIST: [&str; 5] = [
+    const BASE_WHITELIST: [&str; 6] = [
         "host",
         "x-amz-target",
         "content-length",
+        "content-type",
         "accept-encoding",
         "content-encoding",
     ];
-    const AUTH_WHITELIST: [&str; 2] = ["authorization", "x-amz-date"];
+    const AUTH_WHITELIST: [&str; 4] = [
+        "authorization",
+        "x-amz-date",
+        "x-amz-user-agent",
+        "x-amz-security-token",
+    ];
 
     let unallowed_keys: Vec<String> = headers
         .iter()
         .map(|(key, _)| key.to_string())
         .filter(|key| {
-            !(WHITELIST.contains(&key.as_str())
+            !(BASE_WHITELIST.contains(&key.as_str())
                 || preserve_auth_headers && AUTH_WHITELIST.contains(&key.as_str()))
         })
         .collect();
@@ -54,12 +60,21 @@ mod tests {
             .headers_mut()
             .insert("x-amz-target", "DynamoDB_20120810.PutItem");
         request.headers_mut().insert("content-length", "10");
+        request
+            .headers_mut()
+            .insert("content-type", "application/x-amz-json-1.0");
         request.headers_mut().insert("accept-encoding", "gzip");
         request.headers_mut().insert("content-encoding", "gzip");
         request.headers_mut().insert("authorization", "signature");
         request
             .headers_mut()
             .insert("x-amz-date", "20260626T120000Z");
+        request
+            .headers_mut()
+            .insert("x-amz-user-agent", "aws-sdk-rust/test");
+        request
+            .headers_mut()
+            .insert("x-amz-security-token", "session-token");
         request.headers_mut().insert("user-agent", "test");
         request.headers_mut().insert("amz-sdk-request", "attempt=1");
         request
@@ -74,10 +89,13 @@ mod tests {
         assert!(request.headers().contains_key("host"));
         assert!(request.headers().contains_key("x-amz-target"));
         assert!(request.headers().contains_key("content-length"));
+        assert!(request.headers().contains_key("content-type"));
         assert!(request.headers().contains_key("accept-encoding"));
         assert!(request.headers().contains_key("content-encoding"));
         assert!(!request.headers().contains_key("authorization"));
         assert!(!request.headers().contains_key("x-amz-date"));
+        assert!(!request.headers().contains_key("x-amz-user-agent"));
+        assert!(!request.headers().contains_key("x-amz-security-token"));
         assert!(!request.headers().contains_key("user-agent"));
         assert!(!request.headers().contains_key("amz-sdk-request"));
     }
@@ -91,10 +109,13 @@ mod tests {
         assert!(request.headers().contains_key("host"));
         assert!(request.headers().contains_key("x-amz-target"));
         assert!(request.headers().contains_key("content-length"));
+        assert!(request.headers().contains_key("content-type"));
         assert!(request.headers().contains_key("accept-encoding"));
         assert!(request.headers().contains_key("content-encoding"));
         assert!(request.headers().contains_key("authorization"));
         assert!(request.headers().contains_key("x-amz-date"));
+        assert!(request.headers().contains_key("x-amz-user-agent"));
+        assert!(request.headers().contains_key("x-amz-security-token"));
         assert!(!request.headers().contains_key("user-agent"));
         assert!(!request.headers().contains_key("amz-sdk-request"));
     }
