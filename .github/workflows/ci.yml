@@ -8,30 +8,53 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.94.1
+  RUSTDOC_TOOLCHAIN: nightly-2026-06-23
+  CCM_COMMIT: f9e8f8c221f76251318c61ba8a0ce6acec860f6d
+
+permissions:
+  contents: read
 
 jobs:
   static_checks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Install Rust 1.94.1
       run: |
-        rustup toolchain install 1.94.1 --profile minimal --component rustfmt,clippy --no-self-update
-        rustup default 1.94.1
-    - name: Static analysis
-      run: CARGO="cargo --locked" make lint
+        rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --no-self-update
+        rustup default "$RUST_VERSION"
+    - name: Install pinned release policy tools
+      run: |
+        cargo install cargo-audit --version 0.22.2 --locked
+        cargo install cargo-deny --version 0.20.2 --locked
+        cargo install cargo-semver-checks --version 0.50.0 --locked
+    - name: Shared static, security, and packaging gates
+      run: |
+        CARGO="cargo --locked" make static-checks
+        CARGO="cargo --locked" make security-checks
+        CARGO="cargo --locked" make package-check
 
   tests:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
-    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-    - name: Install Rust 1.94.1
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Install pinned Rust toolchains
       run: |
-        rustup toolchain install 1.94.1 --profile minimal --no-self-update
-        rustup default 1.94.1
-    - name: Install scylla-ccm
-      run: pip3 install https://github.com/scylladb/scylla-ccm/archive/master.zip
+        rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+        rustup toolchain install "$RUSTDOC_TOOLCHAIN" --profile minimal --no-self-update
+        rustup default "$RUST_VERSION"
+    - name: Install pinned scylla-ccm
+      run: |
+        python3 -m venv "$RUNNER_TEMP/ccm-venv"
+        "$RUNNER_TEMP/ccm-venv/bin/pip" install \
+          "https://github.com/scylladb/scylla-ccm/archive/$CCM_COMMIT.zip"
+        echo "$RUNNER_TEMP/ccm-venv/bin" >>"$GITHUB_PATH"
     - name: Tests
-      run: CARGO="cargo --locked" make test-all
+      env:
+        SCYLLA_ARCH: x86_64
+      run: |
+        scylla_version=$(bash scripts/release/release-policy.sh scylla-versions | jq -er '.[0]')
+        CCM_SCYLLA_VERSION="release:$scylla_version" CARGO="cargo --locked" make test-all

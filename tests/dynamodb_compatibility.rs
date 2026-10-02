@@ -24,7 +24,7 @@
 //!
 //! Test workflow:
 //!     1. Using the `rustdoc` command, we generate .json documentation files for
-//!         the alternator-driver and aws-sdk-dynamodb crates.
+//!         the alternator_driver library and aws-sdk-dynamodb crate.
 //!
 //!     2. We load these crates into memory using `rustdoc_types::Crate`.
 //!
@@ -39,14 +39,21 @@ use std::collections::HashSet;
 use std::process::Command;
 use std::sync::LazyLock;
 
+const DEFAULT_RUSTDOC_TOOLCHAIN: &str = "nightly-2026-06-23";
+
 /// Use `rustdoc` to generate .json documentation files for
-/// aws-sdk-dynamodb and alternator-driver crates.
+/// aws-sdk-dynamodb and the alternator_driver library.
 fn generate_json_docs() {
-    // alternator-driver
+    let rustdoc_toolchain =
+        std::env::var("RUSTDOC_TOOLCHAIN").unwrap_or_else(|_| DEFAULT_RUSTDOC_TOOLCHAIN.to_owned());
+    let rustdoc_toolchain = format!("+{}", rustdoc_toolchain.trim_start_matches('+'));
+
+    // alternator_driver library target
     let output = Command::new("cargo")
         .args([
-            "+nightly",
+            rustdoc_toolchain.as_str(),
             "rustdoc",
+            "--locked",
             "--",
             "-Z",
             "unstable-options",
@@ -65,8 +72,9 @@ fn generate_json_docs() {
     // aws-sdk-dynamodb
     let output = Command::new("cargo")
         .args([
-            "+nightly",
+            rustdoc_toolchain.as_str(),
             "rustdoc",
+            "--locked",
             "-p",
             "aws-sdk-dynamodb",
             "--",
@@ -148,19 +156,19 @@ fn collect_struct_methods(crate_: &Crate, struct_name: &str) -> HashSet<(Option<
 }
 
 static DOCS: LazyLock<(Crate, Crate)> = LazyLock::new(|| {
-    // generate .json docs for alternator-driver and aws-sdk-dynamodb
+    // generate .json docs for alternator_driver and aws-sdk-dynamodb
     generate_json_docs();
 
     // load json files, and deserialize into readable objects
     (
-        load_json_docs("alternator-driver"),
+        load_json_docs("alternator_driver"),
         load_json_docs("aws-sdk-dynamodb"),
     )
 });
 
 #[test]
 fn test_client() {
-    // generate json docs for aws-sdk-dynamodb and alternator-driver (if needed), load them into memory
+    // generate JSON docs for aws-sdk-dynamodb and alternator_driver (if needed), load them into memory
     let (alternator_driver, dynamodb) = &*DOCS;
 
     // look up methods implemented by dynamodb but not our driver
@@ -183,7 +191,7 @@ fn test_client() {
 
 #[test]
 fn test_config() {
-    // generate json docs for aws-sdk-dynamodb and alternator-driver (if needed), load them into memory
+    // generate JSON docs for aws-sdk-dynamodb and alternator_driver (if needed), load them into memory
     let (alternator_driver, dynamodb) = &*DOCS;
 
     // look up methods implemented by dynamodb but not our driver
@@ -211,7 +219,7 @@ fn test_config() {
 
 #[test]
 fn test_builder() {
-    // generate json docs for aws-sdk-dynamodb and alternator-driver (if needed), load them into memory
+    // generate JSON docs for aws-sdk-dynamodb and alternator_driver (if needed), load them into memory
     let (alternator_driver, dynamodb) = &*DOCS;
 
     // look up methods implemented by dynamodb but not our driver

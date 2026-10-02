@@ -158,7 +158,8 @@ async fn ccm_wrapper_test_cluster() -> Result<(), Box<dyn std::error::Error>> {
 
     let ip_prefix = IpPrefix::new("127.0.1.")?;
     let cluster_name = uuid::Uuid::new_v4().to_string();
-    let scylla_version = String::from("release:2025.1");
+    let scylla_version =
+        std::env::var("CCM_SCYLLA_VERSION").unwrap_or_else(|_| String::from("release:2025.1.16"));
 
     let mut cluster = ClusterGuard(Ccm::create_cluster(
         cluster_name,

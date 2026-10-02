@@ -1,0 +1,72 @@
+name: Scheduled maintenance
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.94.1
+  RUSTDOC_TOOLCHAIN: nightly-2026-06-23
+  CCM_COMMIT: f9e8f8c221f76251318c61ba8a0ce6acec860f6d
+
+jobs:
+  fresh_dependencies:
+    name: Fresh dependency resolution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchains
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --no-self-update
+          rustup toolchain install "$RUSTDOC_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Resolve current compatible dependencies
+        run: cargo update
+      - name: Run source and portable gates against the fresh resolution
+        run: |
+          make static-checks
+          make test-portable
+
+  moving_scylla:
+    name: Moving Scylla ${{ matrix.series }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - series: '2026.1'
+            alternator_http_compression: true
+          - series: '2025.1'
+            alternator_http_compression: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Install pinned scylla-ccm
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ccm-venv"
+          "$RUNNER_TEMP/ccm-venv/bin/pip" install \
+            "https://github.com/scylladb/scylla-ccm/archive/$CCM_COMMIT.zip"
+          echo "$RUNNER_TEMP/ccm-venv/bin" >>"$GITHUB_PATH"
+      - name: Test the moving supported release
+        env:
+          CCM_SCYLLA_VERSION: release:${{ matrix.series }}
+          SCYLLA_ARCH: x86_64
+          ALTERNATOR_HTTP_COMPRESSION: ${{ matrix.alternator_http_compression }}
+        run: |
+          CARGO='cargo --locked' make test-server \
+            SCYLLA_ALTERNATOR_HTTP_COMPRESSION="$ALTERNATOR_HTTP_COMPRESSION"
+          CARGO='cargo --locked' make test-ccm

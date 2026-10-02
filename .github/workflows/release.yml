@@ -1,0 +1,597 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Final package version (X.Y.Z)
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGE_NAME: alternator-client
+  RELEASE_VERSION: ${{ inputs.version }}
+  RUST_VERSION: 1.94.1
+  RUSTDOC_TOOLCHAIN: nightly-2026-06-23
+  CCM_COMMIT: f9e8f8c221f76251318c61ba8a0ce6acec860f6d
+  CARGO_CYCLONEDX_VERSION: 0.5.9
+  CARGO_AUDIT_VERSION: 0.22.2
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_SEMVER_CHECKS_VERSION: 0.50.0
+
+jobs:
+  preflight:
+    name: Preflight and allocate immutable RC
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: crates-io
+    permissions:
+      contents: write
+    outputs:
+      commit_sha: ${{ steps.identity.outputs.commit_sha }}
+      rc_tag: ${{ steps.rc.outputs.rc_tag }}
+      portable_matrix: ${{ steps.policy.outputs.portable_matrix }}
+      scylla_matrix: ${{ steps.policy.outputs.scylla_matrix }}
+    steps:
+      - name: Check out the dispatch commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Load reviewed release policy
+        id: policy
+        run: |
+          echo "portable_matrix=$(bash scripts/release/release-policy.sh portable-matrix)" >>"$GITHUB_OUTPUT"
+          echo "scylla_matrix=$(bash scripts/release/release-policy.sh scylla-matrix)" >>"$GITHUB_OUTPUT"
+      - name: Validate release inputs and repository settings
+        env:
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: bash scripts/release/preflight.sh "$RELEASE_VERSION"
+      - name: Record immutable commit
+        id: identity
+        run: echo "commit_sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+      - name: Allocate or recover this run's RC tag
+        id: rc
+        run: >-
+          bash scripts/release/allocate-rc.sh
+          "$RELEASE_VERSION"
+          '${{ steps.identity.outputs.commit_sha }}'
+
+  package:
+    name: Package and attest candidate
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.artifact.outputs.name }}
+      crate_sha256: ${{ steps.package.outputs.crate_sha256 }}
+    steps:
+      - name: Check out immutable RC commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Rust toolchains
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup toolchain install "$RUSTDOC_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Install pinned SBOM generator
+        run: cargo install cargo-cyclonedx --version "$CARGO_CYCLONEDX_VERSION" --locked
+      - name: Create candidate before any test runs
+        id: package
+        run: |
+          mkdir '${{ runner.temp }}/candidate'
+          bash scripts/release/package-candidate.sh \
+            "$RELEASE_VERSION" \
+            '${{ needs.preflight.outputs.rc_tag }}' \
+            '${{ needs.preflight.outputs.commit_sha }}' \
+            '${{ runner.temp }}/candidate'
+      - name: Name this attempt's candidate artifact
+        id: artifact
+        run: echo "name=alternator-client-${{ needs.preflight.outputs.rc_tag }}-attempt-${{ github.run_attempt }}" >>"$GITHUB_OUTPUT"
+      - name: Require deterministic regeneration on rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          bash scripts/release/compare-previous-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ steps.artifact.outputs.name }}'
+          'alternator-client-${{ needs.preflight.outputs.rc_tag }}-attempt-'
+      - name: Upload immutable candidate artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: ${{ runner.temp }}/candidate/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
+  attest_candidate:
+    name: Attest candidate provenance
+    needs: [preflight, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download packaged candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Attest candidate build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/candidate/*
+      - name: Attest candidate SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/candidate/alternator-client-${{ env.RELEASE_VERSION }}.crate
+          sbom-path: ${{ runner.temp }}/candidate/alternator-client-${{ env.RELEASE_VERSION }}.cdx.json
+
+  portable:
+    name: Portable (${{ matrix.target }})
+    needs: [preflight, package, attest_candidate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.preflight.outputs.portable_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out candidate verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Download exact candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Verify and extract candidate
+        id: candidate
+        run: >-
+          bash scripts/release/verify-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/extract'
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Install pinned Rust toolchains
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup toolchain install "$RUSTDOC_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Assert native host
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = '${{ matrix.target }}'
+      - name: Test extracted candidate
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        env:
+          EXPECTED_RUST_HOST: ${{ matrix.target }}
+        run: CARGO='cargo --locked' make test-portable
+
+  static_candidate:
+    name: Static checks (candidate)
+    needs: [preflight, package, attest_candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out candidate verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Download exact candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Verify and extract candidate
+        id: candidate
+        run: >-
+          bash scripts/release/verify-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/extract'
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Install pinned Rust with lint components
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Run shared static checks on extracted candidate
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        run: CARGO='cargo --locked' make static-checks
+
+  security_candidate:
+    name: Dependency security and policy (candidate)
+    needs: [preflight, package, attest_candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out candidate verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Download exact candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Verify and extract candidate
+        id: candidate
+        run: >-
+          bash scripts/release/verify-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/extract'
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Install pinned Rust and security tools
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked
+      - name: Audit extracted candidate
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        run: make security-checks
+
+  packaging_candidate:
+    name: Publication and compatibility (candidate)
+    needs: [preflight, package, attest_candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out candidate verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Download exact candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Verify and extract candidate
+        id: candidate
+        run: >-
+          bash scripts/release/verify-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/extract'
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Install pinned Rust and compatibility tool
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+          cargo install cargo-semver-checks --version "$CARGO_SEMVER_CHECKS_VERSION" --locked
+      - name: Inspect exact package contents
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        env:
+          CANDIDATE_CRATE: ${{ runner.temp }}/candidate/alternator-client-${{ env.RELEASE_VERSION }}.crate
+        run: bash scripts/release/inspect-package.sh "$RELEASE_VERSION" "$CANDIDATE_CRATE"
+      - name: Prepare extracted source for Cargo publication validation
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        run: |
+          mv Cargo.toml.orig Cargo.toml
+          rm -f .cargo_vcs_info.json
+      - name: Run publication dry-run and SemVer check
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        run: |
+          CARGO='cargo --locked' make package-dry-run
+          make semver-check
+
+  scylla:
+    name: Scylla (${{ matrix.arch }}, ${{ matrix.scylla }})
+    needs: [preflight, package, attest_candidate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.preflight.outputs.scylla_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Check out candidate verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Download exact candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Verify and extract candidate
+        id: candidate
+        run: >-
+          bash scripts/release/verify-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/extract'
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Assert native host
+        run: |
+          test "$(rustc -vV | sed -n 's/^host: //p')" = '${{ matrix.target }}'
+      - name: Install pinned scylla-ccm
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ccm-venv"
+          "$RUNNER_TEMP/ccm-venv/bin/pip" install \
+            "https://github.com/scylladb/scylla-ccm/archive/$CCM_COMMIT.zip"
+          echo "$RUNNER_TEMP/ccm-venv/bin" >>"$GITHUB_PATH"
+      - name: Run complete Scylla suite on extracted candidate
+        working-directory: ${{ steps.candidate.outputs.package_dir }}
+        env:
+          CCM_SCYLLA_VERSION: release:${{ matrix.scylla }}
+          SCYLLA_ARCH: ${{ matrix.arch }}
+          ALTERNATOR_HTTP_COMPRESSION: ${{ matrix.alternator_http_compression }}
+        run: |
+          CARGO='cargo --locked' make test-server \
+            SCYLLA_ALTERNATOR_HTTP_COMPRESSION="$ALTERNATOR_HTTP_COMPRESSION"
+          CARGO='cargo --locked' make test-ccm
+
+  portable_gate:
+    name: Portable gate
+    if: ${{ always() }}
+    needs: portable
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require every portable matrix cell
+        env:
+          RESULT: ${{ needs.portable.result }}
+        run: test "$RESULT" = success
+
+  static_release_gate:
+    name: Static, security, and packaging gate
+    if: ${{ always() }}
+    needs: [static_candidate, security_candidate, packaging_candidate]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require every release check
+        env:
+          STATIC_RESULT: ${{ needs.static_candidate.result }}
+          SECURITY_RESULT: ${{ needs.security_candidate.result }}
+          PACKAGING_RESULT: ${{ needs.packaging_candidate.result }}
+        run: |
+          test "$STATIC_RESULT" = success
+          test "$SECURITY_RESULT" = success
+          test "$PACKAGING_RESULT" = success
+
+  scylla_gate:
+    name: Scylla gate
+    if: ${{ always() }}
+    needs: scylla
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require every Scylla matrix cell
+        env:
+          RESULT: ${{ needs.scylla.result }}
+        run: test "$RESULT" = success
+
+  evidence:
+    name: Preserve test evidence
+    if: ${{ always() && needs.package.result == 'success' }}
+    needs: [preflight, package, portable_gate, static_release_gate, scylla_gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.identity.outputs.artifact_name }}
+    steps:
+      - name: Check out evidence generator
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          persist-credentials: false
+      - name: Create immutable evidence record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PORTABLE_RESULT: ${{ needs.portable_gate.result }}
+          STATIC_RESULT: ${{ needs.static_release_gate.result }}
+          SCYLLA_RESULT: ${{ needs.scylla_gate.result }}
+        run: >-
+          bash scripts/release/create-evidence.sh
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+          test-evidence.json
+      - name: Name evidence artifact
+        id: identity
+        run: echo "artifact_name=release-evidence-${{ needs.preflight.outputs.rc_tag }}-attempt-${{ github.run_attempt }}" >>"$GITHUB_OUTPUT"
+      - name: Upload test evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.identity.outputs.artifact_name }}
+          path: test-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Mark failed evidence for rerun
+        env:
+          PORTABLE_RESULT: ${{ needs.portable_gate.result }}
+          STATIC_RESULT: ${{ needs.static_release_gate.result }}
+          SCYLLA_RESULT: ${{ needs.scylla_gate.result }}
+        run: |
+          test "$PORTABLE_RESULT" = success
+          test "$STATIC_RESULT" = success
+          test "$SCYLLA_RESULT" = success
+
+  final_gate:
+    name: Final release gate
+    if: ${{ always() }}
+    needs: [portable_gate, static_release_gate, scylla_gate, evidence]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require all gates and evidence
+        env:
+          PORTABLE_RESULT: ${{ needs.portable_gate.result }}
+          STATIC_RESULT: ${{ needs.static_release_gate.result }}
+          SCYLLA_RESULT: ${{ needs.scylla_gate.result }}
+          EVIDENCE_RESULT: ${{ needs.evidence.result }}
+        run: |
+          test "$PORTABLE_RESULT" = success
+          test "$STATIC_RESULT" = success
+          test "$SCYLLA_RESULT" = success
+          test "$EVIDENCE_RESULT" = success
+
+  publish:
+    name: Publish and verify crates.io bytes
+    needs: [preflight, package, final_gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      registry_sha256: ${{ steps.registry.outputs.registry_sha256 || steps.publish.outputs.registry_sha256 }}
+    steps:
+      - name: Check out immutable RC commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Verify candidate identity
+        run: >-
+          bash scripts/release/verify-candidate.sh
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/extract'
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
+          rustup default "$RUST_VERSION"
+      - name: Repackage immutable RC and compare bytes
+        run: >-
+          bash scripts/release/repackage-and-compare.sh
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.commit_sha }}'
+          '${{ runner.temp }}/candidate/alternator-client-${{ env.RELEASE_VERSION }}.crate'
+      - name: Query registry idempotently
+        id: registry
+        run: >-
+          bash scripts/release/registry-state.sh
+          alternator-client
+          "$RELEASE_VERSION"
+          '${{ runner.temp }}/candidate/alternator-client-${{ env.RELEASE_VERSION }}.crate'
+      - name: Refuse to publish a superseded RC
+        if: ${{ steps.registry.outputs.state == 'absent' }}
+        run: >-
+          bash scripts/release/assert-latest-rc.sh
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+      - name: Reject a claimed package name during bootstrap
+        if: ${{ inputs.version == '1.0.0' && steps.registry.outputs.state == 'absent' && steps.registry.outputs.crate_exists == 'true' }}
+        run: |
+          echo 'alternator-client is already claimed on crates.io at another version.' >&2
+          echo 'Do not attempt the local bootstrap; resolve the ownership conflict.' >&2
+          exit 1
+      - name: Stop for the one-time local 1.0.0 bootstrap
+        if: ${{ inputs.version == '1.0.0' && steps.registry.outputs.state == 'absent' && steps.registry.outputs.crate_exists == 'false' }}
+        run: |
+          echo 'alternator-client 1.0.0 must now be published locally from this immutable RC.' >&2
+          echo 'Follow docs/releasing.md, then rerun this workflow run with --failed.' >&2
+          exit 1
+      - name: Obtain short-lived crates.io credential
+        if: ${{ steps.registry.outputs.state == 'absent' }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Publish and verify registry bytes
+        if: ${{ steps.registry.outputs.state == 'absent' }}
+        id: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: >-
+          bash scripts/release/publish-and-verify.sh
+          '${{ github.workspace }}'
+          "$RELEASE_VERSION"
+          '${{ runner.temp }}/candidate/alternator-client-${{ env.RELEASE_VERSION }}.crate'
+      - name: Confirm recovered publication
+        if: ${{ steps.registry.outputs.state == 'exact' }}
+        run: echo 'crates.io already serves the exact tested candidate; resuming finalization.'
+
+  finalize:
+    name: Create immutable GitHub Release
+    needs: [preflight, package, evidence, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: write
+    steps:
+      - name: Check out immutable RC commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit_sha }}
+          fetch-depth: 0
+      - name: Download tested candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ${{ runner.temp }}/candidate
+      - name: Download test evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.evidence.outputs.artifact_name }}
+          path: ${{ runner.temp }}/evidence
+      - name: Finalize only after registry byte verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+        run: >-
+          bash scripts/release/finalize-release.sh
+          "$RELEASE_VERSION"
+          '${{ needs.preflight.outputs.rc_tag }}'
+          '${{ needs.preflight.outputs.commit_sha }}'
+          '${{ runner.temp }}/candidate'
+          '${{ runner.temp }}/evidence/test-evidence.json'

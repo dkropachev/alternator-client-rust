@@ -688,8 +688,9 @@ async fn dns_entrypoint_discovers_live_cluster_nodes_test() {
     });
     start_proxies(cluster, proxy_port, &request_counter).await;
 
+    let entrypoint_scope = scope_utils::datacenter_scope_from_index(cluster, 0);
+    let discovered_node_ips = scope_utils::working_nodes_ips_in_scope(cluster, &entrypoint_scope);
     let scope = RoutingScope::from_cluster();
-    let discovered_node_ips = vec![target_ip.as_str()];
     let client = AlternatorClient::from_conf(
         minimal_builder()
             .scheme("http")

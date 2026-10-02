@@ -28,7 +28,7 @@ use anyhow::Context;
 use itertools::Itertools;
 use std::ffi::OsStr;
 use std::ops::{Deref, DerefMut};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 pub(crate) struct Ccm;
 
@@ -133,12 +133,6 @@ impl Ccm {
         let mut first_rack_nodes_count: usize = 0;
         let mut total_nodes_count: usize = total_first_rack_nodes;
 
-        // We can't run add node asynchronously because of race condition to cluster.conf file, but we can do it with updateconf.
-        // Once the node is added, alternator adding process is spawned. Here we keep all these processes and wait on them later.
-        let mut pending_updateconfs = BatchCcmHandler::new("updateconf");
-
-        // Run the main cluster-building logic in a closure so that we can
-        // always run wait_all() afterwards, even if an error occurs.
         let main_result: anyhow::Result<()> = (|| {
             for (datacenter_idx, datacenter_spec) in topology.datacenters.iter().enumerate() {
                 let dc_name = format!("dc{}", datacenter_idx + 1);
@@ -164,25 +158,23 @@ impl Ccm {
                             CcmCommandRunner::add_node(&node_name, &ip, &dc_name, &rack_name)?;
                         }
                         let node = Node::new(node_name, ip, alternator_port);
-                        let child = Self::add_alternator_to_node(&node)?;
-                        pending_updateconfs.push(node.name.clone(), child);
                         rack.add_node(node);
                     }
                     datacenter.add_rack(rack);
                 }
                 cluster.add_datacenter(datacenter);
             }
+            for node in cluster.nodes() {
+                // Adding nodes writes cluster.conf, while updateconf reads it
+                // and initializes the Scylla repository. Run updates only after
+                // the topology is complete and serialize them to avoid racing
+                // on either shared resource.
+                Self::add_alternator_to_node(node)?;
+            }
             Ok(())
         })();
-        let wait_result = pending_updateconfs.wait_all();
-        match (main_result, wait_result) {
-            (Ok(()), Ok(())) => Ok(cluster),
-            (Err(e), Ok(())) => Err(e),
-            (Ok(()), Err(e)) => Err(e),
-            (Err(e1), Err(e2)) => Err(e1.context(format!(
-                "Additionally, waiting for pending 'ccm updateconf' processes failed: {e2}"
-            ))),
-        }
+        main_result?;
+        Ok(cluster)
     }
 
     pub(crate) fn remove_cluster(cluster: &mut Cluster) -> anyhow::Result<()> {
@@ -220,10 +212,10 @@ impl Ccm {
         Ok(())
     }
 
-    fn add_alternator_to_node(node: &Node) -> anyhow::Result<std::process::Child> {
+    fn add_alternator_to_node(node: &Node) -> anyhow::Result<()> {
         let address = format!("alternator_address:{}", node.ip);
         let port = format!("alternator_port:{}", node.alternator_port);
-        CcmCommandRunner::spawn_update_node_conf(
+        CcmCommandRunner::update_node_conf(
             &node.name,
             &[&address, &port, "alternator_write_isolation:always"],
         )
@@ -322,69 +314,10 @@ impl CcmCommandRunner {
         Self::run(["remove", cluster_name])
     }
 
-    // This command is run by different processes to speed up cluster creation.
-    // It can be done safely because each process only changes 1 separate config file.
-    fn spawn_update_node_conf(
-        node_name: &str,
-        conf: &[&str],
-    ) -> anyhow::Result<std::process::Child> {
+    fn update_node_conf(node_name: &str, conf: &[&str]) -> anyhow::Result<()> {
         let mut args: Vec<&str> = vec![node_name, "updateconf"];
         args.extend_from_slice(conf);
-
-        let command_str = format!("ccm {}", args.join(" "));
-        Command::new("ccm")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to spawn: {}", command_str))
-    }
-}
-
-// This struct is used to handle child processes spawned by ccm.
-pub(crate) struct BatchCcmHandler {
-    command: String,
-    // Node name and process.
-    pending: Vec<(String, std::process::Child)>,
-}
-
-impl BatchCcmHandler {
-    fn new(command: &str) -> Self {
-        Self {
-            command: command.to_string(),
-            pending: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, node_name: String, child: std::process::Child) {
-        self.pending.push((node_name, child));
-    }
-
-    fn wait_all(self) -> anyhow::Result<()> {
-        let mut errors: Vec<String> = Vec::new();
-        for (node_name, child) in self.pending {
-            match child.wait_with_output() {
-                Ok(output) if output.status.success() => {}
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    errors.push(format!(
-                        "{} for {} failed: {}",
-                        self.command, node_name, stdout
-                    ))
-                }
-                Err(e) => errors.push(format!(
-                    "{} for {} wait failed: {}",
-                    self.command, node_name, e
-                )),
-            }
-        }
-        anyhow::ensure!(
-            errors.is_empty(),
-            "Some {} commands failed:\n{}",
-            self.command,
-            errors.join("\n")
-        );
-        Ok(())
+        Self::run(args)
     }
 }
 
