@@ -54,6 +54,7 @@ jobs:
         echo "$RUNNER_TEMP/ccm-venv/bin" >>"$GITHUB_PATH"
     - name: Tests
       env:
-        CCM_SCYLLA_VERSION: release:2026.1.14
         SCYLLA_ARCH: x86_64
-      run: CARGO="cargo --locked" make test-all
+      run: |
+        scylla_version=$(bash scripts/release/release-policy.sh scylla-versions | jq -er '.[0]')
+        CCM_SCYLLA_VERSION="release:$scylla_version" CARGO="cargo --locked" make test-all

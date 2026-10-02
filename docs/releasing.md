@@ -135,6 +135,12 @@ The package is built and attested before testing. Every candidate test extracts
 and tests that package. Test evidence is uploaded separately. If any gate fails,
 there is no crates.io publish, final tag, or GitHub Release.
 
+Scylla 2025.1 predates Alternator HTTP request and response compression. Its
+server gate therefore excludes the five compression interoperability cases;
+those cases run against 2026.1, while portable client-side compression coverage
+still runs on every target. Both release lines run the complete CCM routing and
+load-balancing suite.
+
 The evidence artifact is named
 `release-evidence-vX.Y.Z-rc.N-attempt-K`, is retained for 90 days, and contains
 `test-evidence.json` with the expected matrix targets and recorded job results.
@@ -145,7 +151,9 @@ the new commit receives `rc.N+1`. Do not rerun an old RC after changing source.
 
 For an infrastructure flake, rerun the same workflow run/RC. GitHub assigns the
 rerun a higher attempt number. Its regenerated crate must have the same SHA-256
-as the prior candidate for that RC.
+as the prior candidate for that RC. A full rerun replaces the prior Actions
+artifact, so the packaging job also preserves the candidate digest in the
+prior attempt's log and checks the regenerated crate against that record.
 
 ## Bootstrap `alternator-client` 1.0.0 locally
 
@@ -385,7 +393,11 @@ workflow to rewrite release inputs.
 
 Change Rust, dated nightly, CCM, exact Scylla patch, release-tool, runner, or
 action-SHA pins only in a normal reviewed PR. Validate the replacement pins in
-CI before merging. Never make a scheduled job commit those updates directly.
+CI before merging. The portable and pinned-Scylla release matrices have a
+single reviewed source in `scripts/release/release-policy.json`; the workflow,
+candidate manifest, verifier, and evidence record all read it. The policy also
+records which pinned server release supports Alternator HTTP compression. Never
+make a scheduled job commit those updates directly.
 
 ## Failure and recovery reference
 

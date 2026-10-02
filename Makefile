@@ -16,6 +16,7 @@ ALTERNATOR_READY_TIMEOUT ?= 60
 RUSTFLAGS_CCM ?= --cfg ccm_tests
 RUSTDOC_TOOLCHAIN ?= nightly-2026-06-23
 RUSTC ?= rustc
+SCYLLA_ALTERNATOR_HTTP_COMPRESSION ?= true
 EXPECTED_RUST_HOST ?=
 EXPECTED_LIB_TESTS ?= 223
 EXPECTED_DOCTESTS ?= 14
@@ -193,8 +194,18 @@ test-server: .prepare-ccm .prepare-environment-update-aio-max-nr
 	trap '$(CCM) remove "$(CCM_CLUSTER)"' EXIT; \
 	$(MAKE) scylla-start; \
 	$(MAKE) wait-for-alternator; \
+	server_test_args=(); \
+	if [[ "$(SCYLLA_ALTERNATOR_HTTP_COMPRESSION)" != true ]]; then \
+		server_test_args=( \
+			--skip http_content::body_compression::test_request_compression_deflate \
+			--skip http_content::body_compression::test_request_compression_gzip \
+			--skip http_content::body_compression::test_enabled_by_per_request_customization \
+			--skip http_content::body_compression::test_response_decompression_deflate \
+			--skip http_content::body_compression::test_response_decompression_gzip \
+		); \
+	fi; \
 	ALTERNATOR_TEST_ADDRESS="$(ALTERNATOR_TEST_ADDRESS)" $(CARGO) test --locked \
-		--test http_content_tests --test https_test_tests
+		--test http_content_tests --test https_test_tests -- "$${server_test_args[@]}"
 
 test-ccm: .prepare-ccm .prepare-environment-update-aio-max-nr
 	CCM_SCYLLA_VERSION="$(CCM_SCYLLA_VERSION)" RUSTFLAGS="$(RUSTFLAGS_CCM)" \

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "portable_targets": [
+    {
+      "runner": "ubuntu-24.04",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "runner": "ubuntu-24.04-arm",
+      "target": "aarch64-unknown-linux-gnu"
+    },
+    {
+      "runner": "macos-15-intel",
+      "target": "x86_64-apple-darwin"
+    },
+    {
+      "runner": "macos-15",
+      "target": "aarch64-apple-darwin"
+    }
+  ],
+  "scylla_targets": [
+    {
+      "runner": "ubuntu-24.04",
+      "target": "x86_64-unknown-linux-gnu",
+      "arch": "x86_64"
+    },
+    {
+      "runner": "ubuntu-24.04-arm",
+      "target": "aarch64-unknown-linux-gnu",
+      "arch": "aarch64"
+    }
+  ],
+  "scylla_releases": [
+    {
+      "version": "2026.1.14",
+      "alternator_http_compression": true
+    },
+    {
+      "version": "2025.1.16",
+      "alternator_http_compression": false
+    }
+  ]
+}

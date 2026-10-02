@@ -25,11 +25,10 @@ rc_tag=$2
 commit_sha=$3
 output_dir=$4
 package_name=alternator-client
+release_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rust_version=${RUST_VERSION:-1.94.1}
 rustdoc_toolchain=${RUSTDOC_TOOLCHAIN:-nightly-2026-06-23}
 ccm_commit=${CCM_COMMIT:-f9e8f8c221f76251318c61ba8a0ce6acec860f6d}
-scylla_lts_1=${SCYLLA_LTS_1:-2026.1.14}
-scylla_lts_2=${SCYLLA_LTS_2:-2025.1.16}
 
 for command in cargo git jq shasum; do
     command -v "$command" >/dev/null || {
@@ -37,6 +36,7 @@ for command in cargo git jq shasum; do
         exit 1
     }
 done
+scylla_versions=$(bash "$release_script_dir/release-policy.sh" scylla-versions)
 
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
     echo "invalid release version: $version" >&2
@@ -147,8 +147,7 @@ jq -n \
     --arg rustdoc "$rustdoc_toolchain" \
     --arg rustdoc_actual "$rustdoc_actual" \
     --arg ccm_commit "$ccm_commit" \
-    --arg scylla_lts_1 "$scylla_lts_1" \
-    --arg scylla_lts_2 "$scylla_lts_2" \
+    --argjson scylla_versions "$scylla_versions" \
     --arg cargo_lock_sha256 "$lock_sha" \
     --arg changelog_sha256 "$changelog_sha" \
     --arg source_date_epoch "$source_date_epoch" \
@@ -169,7 +168,7 @@ jq -n \
             rustdoc: {pin: $rustdoc, actual: $rustdoc_actual}
         },
         ccm_commit: $ccm_commit,
-        scylla_versions: [$scylla_lts_1, $scylla_lts_2],
+        scylla_versions: $scylla_versions,
         cargo_lock_sha256: $cargo_lock_sha256,
         changelog_sha256: $changelog_sha256,
         source_date_epoch: $source_date_epoch,
@@ -190,4 +189,5 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "sbom_file=$sbom_file" >>"$GITHUB_OUTPUT"
 fi
 
+echo "candidate-crate-sha256=$crate_sha"
 echo "packaged $crate_file ($crate_sha)"

@@ -24,6 +24,7 @@ version=$1
 rc_tag=$2
 commit_sha=$3
 output_file=$4
+release_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 [[ -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]] || {
     echo "GitHub run context is required" >&2
@@ -52,6 +53,8 @@ all_passed=false
 if [[ "$portable_result" == success && "$static_result" == success && "$scylla_result" == success ]]; then
     all_passed=true
 fi
+portable_matrix=$(bash "$release_script_dir/release-policy.sh" portable-matrix)
+scylla_matrix=$(bash "$release_script_dir/release-policy.sh" scylla-matrix)
 
 jq -n \
     --arg version "$version" \
@@ -64,6 +67,8 @@ jq -n \
     --arg static_result "$static_result" \
     --arg scylla_result "$scylla_result" \
     --argjson all_passed "$all_passed" \
+    --argjson portable_matrix "$portable_matrix" \
+    --argjson scylla_matrix "$scylla_matrix" \
     --slurpfile jobs "$jobs_file" \
     '{
         schema_version: 1,
@@ -73,18 +78,8 @@ jq -n \
         repository: $repository,
         workflow_run_id: $workflow_run_id,
         workflow_run_attempt: $workflow_run_attempt,
-        expected_portable_targets: [
-            {runner: "ubuntu-24.04", target: "x86_64-unknown-linux-gnu"},
-            {runner: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu"},
-            {runner: "macos-15-intel", target: "x86_64-apple-darwin"},
-            {runner: "macos-15", target: "aarch64-apple-darwin"}
-        ],
-        expected_scylla_targets: [
-            {runner: "ubuntu-24.04", arch: "x86_64", version: "2026.1.14"},
-            {runner: "ubuntu-24.04", arch: "x86_64", version: "2025.1.16"},
-            {runner: "ubuntu-24.04-arm", arch: "aarch64", version: "2026.1.14"},
-            {runner: "ubuntu-24.04-arm", arch: "aarch64", version: "2025.1.16"}
-        ],
+        expected_portable_targets: $portable_matrix,
+        expected_scylla_targets: $scylla_matrix,
         aggregate_results: {
             portable: $portable_result,
             static_release: $static_result,

@@ -41,14 +41,14 @@ pub(crate) const POLLING_INTERVAL: Duration = Duration::from_millis(50);
 
 // Since cluster creation is expensive, we create it once and reuse it for every test.
 // Before a test gets access to the cluster, we make sure that all nodes are up and their ports are set to default.
-// Datacenter 1 is a single node which is meant to never be shut down. Its address will be used as a seed address
+// The first node in datacenter 1 is meant to never be shut down. Its address will be used as a seed address
 // for clients and as a redirect target for requests directed to shut down nodes.
 static CLUSTER: OnceLock<Mutex<Cluster>> = OnceLock::new();
 pub(crate) async fn get_cluster() -> MutexGuard<'static, Cluster> {
     let mut cluster = CLUSTER
         .get_or_init(|| {
             let topology = TopologySpecBuilder::new()
-                .datacenter(DatacenterSpec::new().rack(1))
+                .datacenter(DatacenterSpec::new().rack(3))
                 .datacenter(DatacenterSpec::new().rack(1).rack(2))
                 .datacenter(DatacenterSpec::new().rack(2).rack(1))
                 .build()

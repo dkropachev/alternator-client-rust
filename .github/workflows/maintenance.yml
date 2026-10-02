@@ -42,7 +42,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        series: ['2026.1', '2025.1']
+        include:
+          - series: '2026.1'
+            alternator_http_compression: true
+          - series: '2025.1'
+            alternator_http_compression: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,6 +65,8 @@ jobs:
         env:
           CCM_SCYLLA_VERSION: release:${{ matrix.series }}
           SCYLLA_ARCH: x86_64
+          ALTERNATOR_HTTP_COMPRESSION: ${{ matrix.alternator_http_compression }}
         run: |
-          CARGO='cargo --locked' make test-server
+          CARGO='cargo --locked' make test-server \
+            SCYLLA_ALTERNATOR_HTTP_COMPRESSION="$ALTERNATOR_HTTP_COMPRESSION"
           CARGO='cargo --locked' make test-ccm

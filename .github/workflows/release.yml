@@ -36,6 +36,8 @@ jobs:
     outputs:
       commit_sha: ${{ steps.identity.outputs.commit_sha }}
       rc_tag: ${{ steps.rc.outputs.rc_tag }}
+      portable_matrix: ${{ steps.policy.outputs.portable_matrix }}
+      scylla_matrix: ${{ steps.policy.outputs.scylla_matrix }}
     steps:
       - name: Check out the dispatch commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,6 +47,11 @@ jobs:
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
           rustup default "$RUST_VERSION"
+      - name: Load reviewed release policy
+        id: policy
+        run: |
+          echo "portable_matrix=$(bash scripts/release/release-policy.sh portable-matrix)" >>"$GITHUB_OUTPUT"
+          echo "scylla_matrix=$(bash scripts/release/release-policy.sh scylla-matrix)" >>"$GITHUB_OUTPUT"
       - name: Validate release inputs and repository settings
         env:
           RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
@@ -145,15 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - runner: macos-15
-            target: aarch64-apple-darwin
+        include: ${{ fromJSON(needs.preflight.outputs.portable_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     permissions:
@@ -318,23 +317,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            arch: x86_64
-            scylla: 2026.1.14
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            arch: x86_64
-            scylla: 2025.1.16
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            arch: aarch64
-            scylla: 2026.1.14
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            arch: aarch64
-            scylla: 2025.1.16
+        include: ${{ fromJSON(needs.preflight.outputs.scylla_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
@@ -377,8 +360,10 @@ jobs:
         env:
           CCM_SCYLLA_VERSION: release:${{ matrix.scylla }}
           SCYLLA_ARCH: ${{ matrix.arch }}
+          ALTERNATOR_HTTP_COMPRESSION: ${{ matrix.alternator_http_compression }}
         run: |
-          CARGO='cargo --locked' make test-server
+          CARGO='cargo --locked' make test-server \
+            SCYLLA_ALTERNATOR_HTTP_COMPRESSION="$ALTERNATOR_HTTP_COMPRESSION"
           CARGO='cargo --locked' make test-ccm
 
   portable_gate:

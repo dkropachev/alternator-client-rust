@@ -23,9 +23,14 @@ set -euo pipefail
 current_dir=$1
 current_name=$2
 artifact_prefix=$3
+run_attempt=${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}
 
 [[ -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" && -n "${GH_TOKEN:-}" ]] || {
     echo "GitHub run context and GH_TOKEN are required" >&2
+    exit 1
+}
+[[ "$run_attempt" =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid workflow run attempt: $run_attempt" >&2
     exit 1
 }
 
@@ -42,7 +47,81 @@ previous_id=$(jq -r \
     "$artifacts")
 
 if [[ -z "$previous_id" ]]; then
-    echo "no earlier candidate artifact exists for this workflow run"
+    if [[ "$run_attempt" -eq 1 ]]; then
+        echo "no earlier candidate exists for the first workflow attempt"
+        exit 0
+    fi
+
+    # GitHub removes earlier artifacts when all jobs are rerun. Attempt logs
+    # remain available, so use the digest emitted after successful candidate
+    # creation rather than silently skipping the reproducibility check.
+    prior_hashes=$(mktemp)
+    found_prior_candidate=false
+    for ((attempt = 1; attempt < run_attempt; attempt++)); do
+        jobs=$(mktemp)
+        gh api --paginate --slurp -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$attempt/jobs?per_page=100" \
+            >"$jobs"
+
+        while IFS=$'\t' read -r job_id candidate_step_result; do
+            [[ -n "$job_id" && "$candidate_step_result" == success ]] || continue
+            found_prior_candidate=true
+            job_log=$(mktemp)
+            gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+                --attempt "$attempt" --job "$job_id" --log >"$job_log" || {
+                echo "could not read candidate log from workflow attempt $attempt" >&2
+                exit 1
+            }
+            logged_hashes=$(grep -oE 'candidate-crate-sha256=[0-9a-f]{64}' "$job_log" \
+                | cut -d= -f2 | LC_ALL=C sort -u || true)
+            [[ -n "$logged_hashes" && "$(printf '%s\n' "$logged_hashes" | wc -l)" -eq 1 ]] || {
+                echo "workflow attempt $attempt has no unique recorded candidate digest" >&2
+                exit 1
+            }
+            printf '%s\n' "$logged_hashes" >>"$prior_hashes"
+        done < <(jq -r '
+            .[].jobs[] |
+            select(.name == "Package and attest candidate") |
+            [
+                (.id | tostring),
+                ([.steps[]? |
+                    select(.name == "Create candidate before any test runs") |
+                    .conclusion][0] // "")
+            ] | @tsv
+        ' "$jobs")
+    done
+
+    if [[ "$found_prior_candidate" != true ]]; then
+        echo "no earlier completed candidate exists for this workflow run"
+        exit 0
+    fi
+
+    prior_hash=$(LC_ALL=C sort -u "$prior_hashes")
+    [[ "$(printf '%s\n' "$prior_hash" | awk 'NF { count++ } END { print count + 0 }')" -eq 1 ]] || {
+        echo "earlier workflow attempts recorded different candidate digests" >&2
+        exit 1
+    }
+    manifest="$current_dir/release-manifest.json"
+    [[ -f "$manifest" ]] || {
+        echo "current candidate is missing release-manifest.json" >&2
+        exit 1
+    }
+    crate_file=$(jq -er '.crate.file' "$manifest")
+    manifest_hash=$(jq -er '.crate.sha256' "$manifest")
+    [[ -f "$current_dir/$crate_file" ]] || {
+        echo "current candidate is missing $crate_file" >&2
+        exit 1
+    }
+    current_hash=$(shasum -a 256 "$current_dir/$crate_file" | awk '{ print $1 }')
+    [[ "$current_hash" == "$manifest_hash" ]] || {
+        echo "current crate digest differs from its manifest" >&2
+        exit 1
+    }
+    [[ "$current_hash" == "$prior_hash" ]] || {
+        echo "regenerated crate differs: prior=$prior_hash current=$current_hash" >&2
+        exit 1
+    }
+    echo "regenerated crate matches the digest preserved in prior-attempt logs"
     exit 0
 fi
 

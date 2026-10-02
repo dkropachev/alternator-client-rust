@@ -27,11 +27,10 @@ extract_parent=$2
 expected_version=${3:-}
 expected_rc_tag=${4:-}
 expected_commit=${5:-}
+release_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 expected_rust=${RUST_VERSION:-1.94.1}
 expected_rustdoc=${RUSTDOC_TOOLCHAIN:-nightly-2026-06-23}
 expected_ccm=${CCM_COMMIT:-f9e8f8c221f76251318c61ba8a0ce6acec860f6d}
-expected_scylla_1=${SCYLLA_LTS_1:-2026.1.14}
-expected_scylla_2=${SCYLLA_LTS_2:-2025.1.16}
 
 for command in jq shasum tar; do
     command -v "$command" >/dev/null || {
@@ -39,6 +38,7 @@ for command in jq shasum tar; do
         exit 1
     }
 done
+expected_scylla_versions=$(bash "$release_script_dir/release-policy.sh" scylla-versions)
 
 [[ -d "$artifact_dir" ]] || {
     echo "candidate artifact directory does not exist: $artifact_dir" >&2
@@ -83,8 +83,7 @@ jq -e \
     --arg rust "$expected_rust" \
     --arg rustdoc "$expected_rustdoc" \
     --arg ccm "$expected_ccm" \
-    --arg scylla_1 "$expected_scylla_1" \
-    --arg scylla_2 "$expected_scylla_2" '
+    --argjson scylla_versions "$expected_scylla_versions" '
     .schema_version == 1 and
     .crate.name == "alternator-client" and
     .crate.library_name == "alternator_driver" and
@@ -93,7 +92,7 @@ jq -e \
     .toolchains.rustdoc.pin == $rustdoc and
     (.toolchains.rustdoc.actual | type == "string" and length > 0) and
     .ccm_commit == $ccm and
-    .scylla_versions == [$scylla_1, $scylla_2] and
+    .scylla_versions == $scylla_versions and
     (.workflow_run_id | type == "string" and length > 0)
 ' "$manifest" >/dev/null
 

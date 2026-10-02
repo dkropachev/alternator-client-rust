@@ -129,6 +129,9 @@ if [[ "$index_status" == 200 ]] && jq -e --arg version "$version" 'select(.vers 
 elif [[ "$index_status" == 200 && "$version" == 1.0.0 ]]; then
     echo "$package_name is already claimed on crates.io; local 1.0.0 bootstrap is unsafe" >&2
     exit 1
+elif [[ "$index_status" == 404 && "$version" != 1.0.0 ]]; then
+    echo "$package_name is unclaimed; the initial release must be 1.0.0" >&2
+    exit 1
 elif [[ "$index_status" != 200 && "$index_status" != 404 ]]; then
     echo "crates.io sparse index preflight returned HTTP $index_status" >&2
     exit 1
