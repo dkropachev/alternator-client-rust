@@ -23,10 +23,13 @@ pub use flate2::Compression as CompressionLevel;
 pub(crate) const DEFAULT_MAX_RESPONSE_ENCODING_LAYERS: usize = 5;
 pub(crate) const DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Compression algorithm used for an outgoing request body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CompressionAlgorithm {
+    /// Gzip compression, advertised with `Content-Encoding: gzip`.
     Gzip,
+    /// Zlib-wrapped DEFLATE compression, advertised with `Content-Encoding: deflate`.
     Deflate,
 }
 
@@ -110,7 +113,9 @@ fn decompress_zlib(content: &[u8]) -> Option<Vec<u8>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResponseCompressionAlgorithm {
+    /// Gzip compression, represented by the `gzip` content-coding token.
     Gzip,
+    /// Zlib-wrapped DEFLATE compression, represented by the `deflate` content-coding token.
     Deflate,
 }
 

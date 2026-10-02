@@ -17,6 +17,7 @@ use aws_smithy_runtime_api::http::Request;
 use std::fmt;
 use std::sync::Arc;
 
+/// Default value sent in the `User-Agent` header.
 pub const DEFAULT_USER_AGENT: &str = concat!(
     "scylladb-alternator-client-rust/",
     env!("CARGO_PKG_VERSION")
@@ -24,25 +25,38 @@ pub const DEFAULT_USER_AGENT: &str = concat!(
 
 type UserAgentTransform = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// Configures the final `User-Agent` header sent with each request.
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub enum UserAgent {
+    /// Sends [`DEFAULT_USER_AGENT`].
     #[default]
     Default,
+    /// Omits the `User-Agent` header.
     Disabled,
+    /// Replaces the default with the contained value.
     Value(String),
+    /// Computes the header value from [`DEFAULT_USER_AGENT`].
+    ///
+    /// Returning [`None`] omits the header.
     Transform(UserAgentTransform),
 }
 
 impl UserAgent {
+    /// Returns a configuration that omits the `User-Agent` header.
     pub fn disabled() -> Self {
         Self::Disabled
     }
 
+    /// Returns a configuration that sends `user_agent` exactly as supplied.
     pub fn value(user_agent: impl Into<String>) -> Self {
         Self::Value(user_agent.into())
     }
 
+    /// Returns a configuration that derives the header from the default value.
+    ///
+    /// The callback receives [`DEFAULT_USER_AGENT`] and its result becomes the
+    /// complete header value.
     pub fn transform<F>(transform: F) -> Self
     where
         F: Fn(&str) -> String + Send + Sync + 'static,
@@ -52,6 +66,10 @@ impl UserAgent {
         }))
     }
 
+    /// Returns a configuration that optionally derives a header from the default value.
+    ///
+    /// The callback receives [`DEFAULT_USER_AGENT`]. Returning [`None`] omits
+    /// the header; returning [`Some`] supplies the complete header value.
     pub fn transform_optional<F>(transform: F) -> Self
     where
         F: Fn(&str) -> Option<String> + Send + Sync + 'static,

@@ -120,14 +120,27 @@ pub struct AlternatorConfig {
     pub(crate) alternator_ext: AlternatorExtensions,
 }
 impl AlternatorConfig {
+    /// Creates a builder for a client-wide Alternator configuration.
+    ///
+    /// The builder starts without imported shared AWS SDK settings. Configure
+    /// the supported settings explicitly before calling
+    /// [`AlternatorBuilder::build`].
     pub fn builder() -> AlternatorBuilder {
         AlternatorBuilder::default()
     }
 
+    /// Creates a builder for compression overrides on one operation.
+    ///
+    /// Pass the result to
+    /// [`AlternatorCustomizableOperation::alternator_config_override`].
     pub fn operation_builder() -> AlternatorOperationBuilder {
         AlternatorOperationBuilder::default()
     }
 
+    /// Converts this configuration into a builder for further changes.
+    ///
+    /// Both the underlying AWS SDK settings and all Alternator-specific
+    /// settings are preserved.
     pub fn to_builder(&self) -> AlternatorBuilder {
         AlternatorBuilder {
             dynamodb_builder: self.dynamodb_config.to_builder(),
@@ -349,6 +362,7 @@ pub struct AlternatorOperationBuilder {
 }
 
 impl AlternatorOperationBuilder {
+    /// Creates an empty per-operation compression override.
     pub fn new() -> Self {
         Self::default()
     }
@@ -398,10 +412,19 @@ pub struct AlternatorBuilder {
     pub(crate) alternator_ext: AlternatorExtensions,
 }
 impl AlternatorBuilder {
+    /// Creates a builder with default Alternator and AWS SDK settings.
+    ///
+    /// Unlike a builder derived from [`AlternatorConfig::to_builder`], this
+    /// does not inherit settings from an existing configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Builds an [`AlternatorConfig`] from the configured settings.
+    ///
+    /// The AWS SDK behavior version is pinned to the version validated by this
+    /// driver, and the SDK endpoint URL is derived from the first configured
+    /// seed host, scheme, and port.
     pub fn build(mut self) -> AlternatorConfig {
         self.dynamodb_builder
             .set_behavior_version(Some(ALTERNATOR_BEHAVIOR_VERSION()));
@@ -769,6 +792,10 @@ impl AlternatorBuilder {
 // All implementations below this point are supported AWS SDK passthroughs.
 
 impl AlternatorConfig {
+    /// Returns the configured stalled-stream protection settings, if any.
+    ///
+    /// When this is [`None`], the pinned AWS SDK behavior version supplies its
+    /// default settings unless the builder explicitly removed them.
     pub fn stalled_stream_protection(
         &self,
     ) -> Option<&aws_sdk_dynamodb::config::StalledStreamProtectionConfig> {
@@ -781,36 +808,54 @@ impl AlternatorConfig {
         self.dynamodb_config.http_client()
     }
 
+    /// Returns the configured request retry policy, if one was provided.
     pub fn retry_config(&self) -> Option<&aws_smithy_types::retry::RetryConfig> {
         self.dynamodb_config.retry_config()
     }
 
+    /// Returns the configured asynchronous sleep implementation, if any.
+    ///
+    /// The SDK uses this implementation for delays such as retry backoff.
     pub fn sleep_impl(&self) -> Option<aws_sdk_dynamodb::config::SharedAsyncSleep> {
         self.dynamodb_config.sleep_impl()
     }
 
+    /// Returns the configured operation and connection timeouts, if any.
     pub fn timeout_config(&self) -> Option<&aws_smithy_types::timeout::TimeoutConfig> {
         self.dynamodb_config.timeout_config()
     }
 
+    /// Returns the explicitly configured partition for retry-related state.
+    ///
+    /// Default partitions with the same name share retry token buckets and
+    /// adaptive rate limiters. Custom partitions share that state only when
+    /// the partition or its components are cloned. When absent, the SDK
+    /// creates its service default.
     pub fn retry_partition(&self) -> Option<&aws_smithy_runtime::client::retries::RetryPartition> {
         self.dynamodb_config.retry_partition()
     }
 
+    /// Returns the identity cache used during authentication, if configured.
     pub fn identity_cache(&self) -> Option<aws_sdk_dynamodb::config::SharedIdentityCache> {
         self.dynamodb_config.identity_cache()
     }
 
+    /// Iterates over user-configured AWS SDK interceptors.
+    ///
+    /// Driver-owned routing and request-processing interceptors are installed
+    /// when an [`AlternatorClient`] is constructed and are not included here.
     pub fn interceptors(
         &self,
     ) -> impl Iterator<Item = aws_sdk_dynamodb::config::SharedInterceptor> {
         self.dynamodb_config.interceptors()
     }
 
+    /// Returns the time source used by the AWS SDK runtime, if configured.
     pub fn time_source(&self) -> Option<aws_smithy_async::time::SharedTimeSource> {
         self.dynamodb_config.time_source()
     }
 
+    /// Iterates over the user-configured retry classifiers.
     pub fn retry_classifiers(
         &self,
     ) -> impl Iterator<Item = aws_smithy_runtime_api::client::retries::classifiers::SharedRetryClassifier>
@@ -818,34 +863,64 @@ impl AlternatorConfig {
         self.dynamodb_config.retry_classifiers()
     }
 
+    /// Returns the application name stored in the underlying SDK config.
+    ///
+    /// This metadata identifies an application in SDK-generated user-agent
+    /// data. [`AlternatorBuilder::user_agent`] controls the final HTTP
+    /// `User-Agent` header sent by this driver.
     pub fn app_name(&self) -> Option<&aws_types::app_name::AppName> {
         self.dynamodb_config.app_name()
     }
 
+    /// Returns framework metadata stored in the underlying SDK config.
+    ///
+    /// Entries are returned in first-seen order. This metadata supports SDK
+    /// integrations; [`AlternatorBuilder::user_agent`] controls the final HTTP
+    /// `User-Agent` header sent by this driver.
     pub fn framework_metadata(&self) -> Vec<&aws_sdk_dynamodb::config::FrameworkMetadata> {
         self.dynamodb_config.framework_metadata()
     }
 
+    /// Returns whether SDK clock-skew correction was explicitly disabled.
+    ///
+    /// [`None`] means the pinned AWS SDK behavior default applies.
     pub fn disable_clock_skew_correction(&self) -> Option<bool> {
         self.dynamodb_config.disable_clock_skew_correction()
     }
 
+    /// Returns the configured SDK invocation ID generator, if any.
+    ///
+    /// Invocation IDs populate the `amz-sdk-invocation-id` request header.
     pub fn invocation_id_generator(
         &self,
     ) -> Option<aws_runtime::invocation_id::SharedInvocationIdGenerator> {
         self.dynamodb_config.invocation_id_generator()
     }
 
+    /// Returns the SigV4 service name used in credential scopes.
+    ///
+    /// DynamoDB and Alternator requests use `dynamodb`.
     pub fn signing_name(&self) -> &'static str {
         self.dynamodb_config.signing_name()
     }
 
+    /// Returns the configured signing region, if one was provided.
+    ///
+    /// Client construction supplies `us-east-1` when no region is configured,
+    /// because SigV4 requires a region even though Alternator routing does not.
     pub fn region(&self) -> Option<&aws_sdk_dynamodb::config::Region> {
         self.dynamodb_config.region()
     }
 }
 
 impl AlternatorBuilder {
+    /// Captures named operation-input members and emits their values as labels
+    /// on the AWS SDK's built-in metrics.
+    ///
+    /// Emitted attributes are also available for in-process inspection.
+    /// Names must identify non-sensitive, string-valued Smithy input members;
+    /// unsupported names have no effect. Avoid high-cardinality values because
+    /// each distinct value creates another metric label value.
     pub fn emit_input_attributes(
         mut self,
         names: impl IntoIterator<Item = impl Into<String>>,
@@ -854,6 +929,12 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Captures named operation-input members for in-process inspection
+    /// without emitting them as metric labels.
+    ///
+    /// Names follow the eligibility rules described by
+    /// [`Self::emit_input_attributes`]. This is suitable for high-cardinality
+    /// values that should not become metric labels.
     pub fn capture_input_attributes(
         mut self,
         names: impl IntoIterator<Item = impl Into<String>>,
@@ -862,6 +943,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures AWS SDK protection against stalled upload and download streams.
+    ///
+    /// This replaces the settings supplied by the driver's pinned SDK behavior
+    /// version.
     pub fn stalled_stream_protection(
         mut self,
         stalled_stream_protection_config: aws_sdk_dynamodb::config::StalledStreamProtectionConfig,
@@ -870,6 +955,13 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets or explicitly removes stalled-stream protection settings.
+    ///
+    /// Passing [`Some`] overrides the pinned AWS SDK default. Passing [`None`]
+    /// explicitly removes that required default, so constructing an
+    /// [`AlternatorClient`] from the resulting config returns an error (or
+    /// panics through [`AlternatorClient::from_conf`]) unless a replacement is
+    /// subsequently configured.
     pub fn set_stalled_stream_protection(
         &mut self,
         stalled_stream_protection_config: Option<
@@ -962,11 +1054,19 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures the AWS SDK retry mode, maximum attempts, and backoff.
+    ///
+    /// Retry token-bucket and adaptive rate-limiter state are controlled
+    /// separately by [`Self::retry_partition`].
     pub fn retry_config(mut self, retry_config: aws_smithy_types::retry::RetryConfig) -> Self {
         self.dynamodb_builder = self.dynamodb_builder.retry_config(retry_config);
         self
     }
 
+    /// Applies an AWS SDK retry configuration when one is provided.
+    ///
+    /// Passing [`None`] has no effect; it does not remove a configuration that
+    /// was set earlier on this builder.
     pub fn set_retry_config(
         &mut self,
         retry_config: Option<aws_smithy_types::retry::RetryConfig>,
@@ -974,6 +1074,10 @@ impl AlternatorBuilder {
         self.dynamodb_builder.set_retry_config(retry_config);
         self
     }
+
+    /// Configures the asynchronous sleep implementation used by the AWS SDK.
+    ///
+    /// The SDK uses this implementation for delays such as retry backoff.
     pub fn sleep_impl(
         mut self,
         sleep_impl: impl aws_sdk_dynamodb::config::AsyncSleep + 'static,
@@ -982,6 +1086,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets or removes the custom asynchronous sleep implementation.
+    ///
+    /// Passing [`None`] clears the explicitly configured implementation,
+    /// allowing the pinned AWS SDK behavior default to apply.
     pub fn set_sleep_impl(
         &mut self,
         sleep_impl: Option<aws_sdk_dynamodb::config::SharedAsyncSleep>,
@@ -990,6 +1098,7 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures AWS SDK operation and connection timeouts.
     pub fn timeout_config(
         mut self,
         timeout_config: aws_smithy_types::timeout::TimeoutConfig,
@@ -998,6 +1107,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Applies AWS SDK timeout settings when one is provided.
+    ///
+    /// Passing [`None`] has no effect. To turn off timeouts, pass
+    /// [`aws_smithy_types::timeout::TimeoutConfig::disabled`] inside [`Some`].
     pub fn set_timeout_config(
         &mut self,
         timeout_config: Option<aws_smithy_types::timeout::TimeoutConfig>,
@@ -1006,6 +1119,13 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets the partition that owns shared retry state.
+    ///
+    /// Default partitions with the same name share retry token buckets and
+    /// adaptive rate limiters. Separately built custom partitions remain
+    /// isolated even when their names match; clone a custom partition or its
+    /// components to share that state. Most clients can use the SDK's default
+    /// DynamoDB partition.
     pub fn retry_partition(
         mut self,
         retry_partition: aws_smithy_runtime::client::retries::RetryPartition,
@@ -1014,6 +1134,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Applies a retry-state partition when one is provided.
+    ///
+    /// Passing [`None`] has no effect; it does not remove a partition that was
+    /// set earlier on this builder.
     pub fn set_retry_partition(
         &mut self,
         retry_partition: Option<aws_smithy_runtime::client::retries::RetryPartition>,
@@ -1022,6 +1146,11 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures the cache used to resolve authentication identities.
+    ///
+    /// The SDK normally uses a lazy cache. Pass an alternative implementation
+    /// to change caching behavior, including an SDK-provided no-cache
+    /// implementation when credentials must be resolved for every request.
     pub fn identity_cache(
         mut self,
         identity_cache: impl aws_sdk_dynamodb::config::ResolveCachedIdentity + 'static,
@@ -1030,6 +1159,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Replaces the cache used to resolve authentication identities.
+    ///
+    /// This mutable-builder form has the same behavior as
+    /// [`Self::identity_cache`].
     pub fn set_identity_cache(
         &mut self,
         identity_cache: impl aws_sdk_dynamodb::config::ResolveCachedIdentity + 'static,
@@ -1037,6 +1170,12 @@ impl AlternatorBuilder {
         self.dynamodb_builder.set_identity_cache(identity_cache);
         self
     }
+
+    /// Adds an AWS SDK interceptor to the request execution pipeline.
+    ///
+    /// User interceptors run alongside the driver-owned routing, compression,
+    /// decompression, user-agent, and header-optimization interceptors that are
+    /// installed when the client is constructed.
     pub fn interceptor(
         mut self,
         interceptor: impl aws_sdk_dynamodb::config::Intercept + 'static,
@@ -1045,6 +1184,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Adds an already shared AWS SDK interceptor.
+    ///
+    /// This is the mutable-builder counterpart to [`Self::interceptor`].
     pub fn push_interceptor(
         &mut self,
         interceptor: aws_sdk_dynamodb::config::SharedInterceptor,
@@ -1053,6 +1195,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Replaces all user-configured AWS SDK interceptors with `interceptors`.
+    ///
+    /// Driver-owned interceptors are installed later during client
+    /// construction and are not replaced by this method.
     pub fn set_interceptors(
         &mut self,
         interceptors: impl IntoIterator<Item = aws_sdk_dynamodb::config::SharedInterceptor>,
@@ -1061,6 +1207,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures the time source used by the AWS SDK runtime.
+    ///
+    /// Custom time sources are primarily useful for deterministic tests.
     pub fn time_source(
         mut self,
         time_source: impl aws_smithy_async::time::TimeSource + 'static,
@@ -1069,6 +1218,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets or removes the custom AWS SDK time source.
+    ///
+    /// Passing [`None`] clears the explicitly configured source, allowing the
+    /// pinned AWS SDK behavior default to apply.
     pub fn set_time_source(
         &mut self,
         time_source: Option<aws_smithy_async::time::SharedTimeSource>,
@@ -1077,6 +1230,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Adds a classifier that decides whether operation results are retryable.
+    ///
+    /// Classifiers run according to their AWS SDK retry-classifier priority.
     pub fn retry_classifier(
         mut self,
         retry_classifier: impl aws_smithy_runtime_api::client::retries::classifiers::ClassifyRetry
@@ -1086,6 +1242,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Adds an already shared retry classifier.
+    ///
+    /// This is the mutable-builder counterpart to [`Self::retry_classifier`].
     pub fn push_retry_classifier(
         &mut self,
         retry_classifier: aws_smithy_runtime_api::client::retries::classifiers::SharedRetryClassifier,
@@ -1095,6 +1254,7 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Replaces all user-configured retry classifiers with `retry_classifiers`.
     pub fn set_retry_classifiers(
         &mut self,
         retry_classifiers: impl IntoIterator<
@@ -1106,16 +1266,30 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets application metadata in the underlying AWS SDK configuration.
+    ///
+    /// The SDK uses this value when constructing SDK user-agent metadata.
+    /// [`Self::user_agent`] controls the final HTTP `User-Agent` header sent by
+    /// this driver.
     pub fn app_name(mut self, app_name: aws_types::app_name::AppName) -> Self {
         self.dynamodb_builder = self.dynamodb_builder.app_name(app_name);
         self
     }
 
+    /// Sets or removes application metadata in the underlying SDK config.
+    ///
+    /// Passing [`None`] removes a name set earlier on this builder.
     pub fn set_app_name(&mut self, app_name: Option<aws_types::app_name::AppName>) -> &mut Self {
         self.dynamodb_builder.set_app_name(app_name);
         self
     }
 
+    /// Appends framework metadata to the underlying AWS SDK configuration.
+    ///
+    /// SDK integrations use entries to identify frameworks or libraries.
+    /// Multiple calls append entries; the SDK de-duplicates equal name and
+    /// version pairs. [`Self::user_agent`] controls the final HTTP `User-Agent`
+    /// header sent by this driver.
     pub fn framework_metadata(
         mut self,
         framework_metadata: aws_sdk_dynamodb::config::FrameworkMetadata,
@@ -1124,6 +1298,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Appends framework metadata using a mutable builder reference.
+    ///
+    /// See [`Self::framework_metadata`] for ordering and user-agent behavior.
     pub fn push_framework_metadata(
         &mut self,
         framework_metadata: aws_sdk_dynamodb::config::FrameworkMetadata,
@@ -1133,6 +1310,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets whether the AWS SDK should skip clock-skew correction.
+    ///
+    /// Pass `true` to disable correction, `false` to explicitly enable it, or
+    /// [`None`] to clear an earlier explicit choice and use the SDK default.
     pub fn disable_clock_skew_correction(
         mut self,
         disable_clock_skew_correction: impl Into<Option<bool>>,
@@ -1143,6 +1324,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets or clears whether the AWS SDK should skip clock-skew correction.
+    ///
+    /// Passing [`None`] restores the pinned AWS SDK behavior default.
     pub fn set_disable_clock_skew_correction(
         &mut self,
         disable_clock_skew_correction: Option<bool>,
@@ -1152,6 +1336,10 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Overrides the generator for `amz-sdk-invocation-id` header values.
+    ///
+    /// The SDK uses random UUIDs by default. A deterministic generator can be
+    /// useful when testing emitted HTTP requests.
     pub fn invocation_id_generator(
         mut self,
         generator: impl aws_runtime::invocation_id::InvocationIdGenerator + 'static,
@@ -1160,6 +1348,9 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets or removes a custom SDK invocation ID generator.
+    ///
+    /// Passing [`None`] restores the SDK's default random generator.
     pub fn set_invocation_id_generator(
         &mut self,
         generator: Option<aws_runtime::invocation_id::SharedInvocationIdGenerator>,
@@ -1168,11 +1359,21 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets or clears the region used for SigV4 request signing.
+    ///
+    /// The value may be a region directly or an [`Option`] containing one.
+    /// When no region remains configured, client construction supplies
+    /// `us-east-1` because SigV4 requires a region even though Alternator
+    /// routing does not.
     pub fn region(mut self, region: impl Into<Option<aws_sdk_dynamodb::config::Region>>) -> Self {
         self.dynamodb_builder = self.dynamodb_builder.region(region);
         self
     }
 
+    /// Sets or clears the region used for SigV4 request signing.
+    ///
+    /// Passing [`None`] removes an explicit region; client construction then
+    /// supplies `us-east-1`.
     pub fn set_region(&mut self, region: Option<aws_sdk_dynamodb::config::Region>) -> &mut Self {
         self.dynamodb_builder.set_region(region);
         self
