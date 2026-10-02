@@ -52,9 +52,7 @@ jobs:
         run: |
           echo "portable_matrix=$(bash scripts/release/release-policy.sh portable-matrix)" >>"$GITHUB_OUTPUT"
           echo "scylla_matrix=$(bash scripts/release/release-policy.sh scylla-matrix)" >>"$GITHUB_OUTPUT"
-      - name: Validate release inputs and repository settings
-        env:
-          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
+      - name: Validate release inputs
         run: bash scripts/release/preflight.sh "$RELEASE_VERSION"
       - name: Record immutable commit
         id: identity
@@ -587,7 +585,6 @@ jobs:
       - name: Finalize only after registry byte verification
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ADMIN_TOKEN: ${{ secrets.RELEASE_ADMIN_TOKEN }}
         run: >-
           bash scripts/release/finalize-release.sh
           "$RELEASE_VERSION"
