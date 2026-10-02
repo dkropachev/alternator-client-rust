@@ -34,10 +34,6 @@ for command in curl gh git jq shasum; do
         exit 1
     }
 done
-[[ -n "${RELEASE_ADMIN_TOKEN:-}" ]] || {
-    echo "RELEASE_ADMIN_TOKEN with repository Administration:read is required" >&2
-    exit 1
-}
 [[ -n "${GITHUB_REPOSITORY:-}" ]] || {
     echo "GITHUB_REPOSITORY is missing" >&2
     exit 1
@@ -61,18 +57,6 @@ GITHUB_OUTPUT="$state_file" scripts/release/registry-state.sh \
     "$package_name" "$version" "$candidate_dir/$crate_file" >/dev/null
 [[ "$(awk -F= '$1 == "state" { print $2 }' "$state_file")" == exact ]] || {
     echo "crates.io does not serve the tested candidate; refusing to finalize" >&2
-    exit 1
-}
-
-immutable_body=$(mktemp)
-immutable_status=$(curl -sS \
-    -H 'Accept: application/vnd.github+json' \
-    -H "Authorization: Bearer $RELEASE_ADMIN_TOKEN" \
-    -H 'X-GitHub-Api-Version: 2026-03-10' \
-    -o "$immutable_body" -w '%{http_code}' \
-    "https://api.github.com/repos/$GITHUB_REPOSITORY/immutable-releases")
-[[ "$immutable_status" == 200 ]] && jq -e '.enabled == true' "$immutable_body" >/dev/null || {
-    echo "GitHub immutable releases are disabled or could not be verified (HTTP $immutable_status)" >&2
     exit 1
 }
 

@@ -26,31 +26,17 @@ releases lock their assets and associated tag and receive a GitHub release
 attestation. Titles and notes remain editable, so the attached manifest and
 changelog hash are the canonical release metadata.
 
-The workflow checks the setting before it creates an RC tag. GitHub's normal
-`GITHUB_TOKEN` cannot read this administrative setting. The workflow as
-checked in expects an expiring, fine-grained personal access token restricted
-to only this repository, with this repository permission only:
-
-- **Administration: Read-only**
-
-After creating the environment described below, store it as the `crates-io`
-environment secret `RELEASE_ADMIN_TOKEN`, not as a repository-wide secret. It
-is used only to call
-`GET /repos/scylladb/alternator-client-rust/immutable-releases`. It does not
-need Contents access or any crates.io permission. The environment's branch
-restriction prevents a non-`main` dispatch from receiving it. Rotate it before
-expiry. A `200` response whose `enabled` property is `true` is required; a
-`404` response means release immutability is not enabled.
-
-A GitHub App can be used instead, but its short-lived installation token must
-be minted during each run; do not store an installation token as the long-term
-secret. That alternative requires replacing the two `RELEASE_ADMIN_TOKEN`
-bindings in `release.yml` with an app-token generation step.
+Treat this as a permanent repository-administration invariant. The release
+workflow deliberately does not hold an Administration token and therefore
+cannot check the setting before publication. It does require the published
+release to report `immutable: true` before declaring success. If an
+administrator disables immutability, finalization may publish a mutable
+release before that verification fails; re-enable the setting before any
+release dispatch rather than relying on recovery afterward.
 
 References:
 
 - [Enable immutable releases](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes)
-- [Immutable-release status endpoint](https://docs.github.com/en/rest/repos/repos?apiVersion=2026-03-10#check-if-immutable-releases-are-enabled-for-a-repository)
 - [What immutable releases protect](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
 
 ### Protect RC tags
@@ -78,10 +64,10 @@ the branch `main`, and add no tag patterns. Do not add required reviewers:
 passing candidates are deliberately promoted without a second approval. Disable
 administrator bypass if the repository plan offers that option.
 
-Add the `RELEASE_ADMIN_TOKEN` environment secret described above. Do not add a
-crates.io token. In particular, there is no bootstrap token or
-`CARGO_REGISTRY_TOKEN` GitHub secret. The first publish is a local operation;
-subsequent publishes use short-lived OIDC credentials.
+Do not add an Administration or crates.io token to this environment. In
+particular, there is no bootstrap token or `CARGO_REGISTRY_TOKEN` GitHub secret.
+The first publish is a local operation; subsequent publishes use short-lived
+OIDC credentials.
 
 The publishing job in `release.yml` must declare `environment: crates-io`.
 The environment restriction is an independent guard in addition to the
