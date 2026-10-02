@@ -171,14 +171,13 @@ impl AlternatorConfig {
         self.alternator_ext.request_compression.clone()
     }
 
-    /// Configures which response encodings the client advertises via `Accept-Encoding`.
+    /// Configures response compression negotiation and decompression limits.
     ///
-    /// This only controls what the client *requests* from the server.
-    /// The server may still return uncompressed responses regardless of this setting.
-    /// Response decompression is based on the `Content-Encoding` header
-    /// and is independent of this configuration.
+    /// Accepted encodings control what the client requests from the server. Supported
+    /// `Content-Encoding` values are still decompressed when negotiation is disabled,
+    /// and the configured decompression limits still apply.
     ///
-    /// Not set by default (disabled).
+    /// Not set by default (negotiation disabled and default limits used).
     pub fn response_compression(&self) -> Option<ResponseCompression> {
         self.alternator_ext.response_compression.clone()
     }
@@ -360,7 +359,7 @@ impl AlternatorOperationBuilder {
         self
     }
 
-    /// Configure which response encodings this request advertises via `Accept-Encoding`.
+    /// Configure response compression negotiation and decompression limits for this request.
     pub fn response_compression(mut self, response_compression: ResponseCompression) -> Self {
         self.response_compression = Some(response_compression);
         self
@@ -508,27 +507,25 @@ impl AlternatorBuilder {
         self
     }
 
-    /// Configure which response encodings the client advertises via `Accept-Encoding`.
+    /// Configure response compression negotiation and decompression limits.
     ///
-    /// This only controls what the client *requests* from the server.
-    /// The server may still return uncompressed responses regardless of this setting.
-    /// Response decompression is based on the `Content-Encoding` header
-    /// and is independent of this configuration.
+    /// Accepted encodings control what the client requests from the server. Supported
+    /// `Content-Encoding` values are still decompressed when negotiation is disabled,
+    /// and the configured decompression limits still apply.
     ///
-    /// Not set by default (disabled).
+    /// Not set by default (negotiation disabled and default limits used).
     pub fn response_compression(mut self, response_compression: ResponseCompression) -> Self {
         self.set_response_compression(response_compression);
         self
     }
 
-    /// Configure which response encodings the client advertises via `Accept-Encoding`.
+    /// Configure response compression negotiation and decompression limits.
     ///
-    /// This only controls what the client *requests* from the server.
-    /// The server may still return uncompressed responses regardless of this setting.
-    /// Response decompression is based on the `Content-Encoding` header
-    /// and is independent of this configuration.
+    /// Accepted encodings control what the client requests from the server. Supported
+    /// `Content-Encoding` values are still decompressed when negotiation is disabled,
+    /// and the configured decompression limits still apply.
     ///
-    /// Not set by default (disabled).
+    /// Not set by default (negotiation disabled and default limits used).
     pub fn set_response_compression(
         &mut self,
         response_compression: ResponseCompression,
@@ -1478,17 +1475,18 @@ mod test {
 
     #[test]
     fn config_remembers_response_compression() {
+        let response_compression = ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip)
+            .with_max_encoding_layers(7)
+            .with_max_decompressed_bytes(64 * 1024 * 1024);
         let config = AlternatorConfig::builder()
-            .response_compression(ResponseCompression::enabled(
-                ResponseCompressionAlgorithm::Gzip,
-            ))
+            .response_compression(response_compression.clone())
             .build();
 
         assert_eq!(
             config
                 .response_compression()
                 .expect("response_compression not set"),
-            ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip)
+            response_compression
         );
 
         // round-trip through to_builder
@@ -1498,7 +1496,7 @@ mod test {
             config
                 .response_compression()
                 .expect("response_compression not set after round-trip"),
-            ResponseCompression::enabled(ResponseCompressionAlgorithm::Gzip)
+            response_compression
         );
     }
 

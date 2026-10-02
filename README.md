@@ -506,6 +506,8 @@ or by using `.customize().alternator_config_override(...)` with `AlternatorConfi
 
 The default is `disabled()`; use `enabled()`, `enabled_many()`, or `enabled_all()` to advertise the desired encodings.
 
+For safety, the default accepts at most five stacked content encodings and lets each decoding layer expand to at most 32 MiB. Responses that exceed either limit fail before deserialization. These limits also apply to compressed responses that were not negotiated. Use `with_max_encoding_layers()` and `with_max_decompressed_bytes()` when a deployment needs different limits.
+
 ## Per-operation override
 
 To override an Alternator-specific setting for one request, use the same `.customize()` pattern that DynamoDB uses.
