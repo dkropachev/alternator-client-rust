@@ -191,9 +191,10 @@ gh run download "$RUN_ID" --repo "$REPOSITORY" \
   --name "$ARTIFACT_NAME" --dir "$release_root/candidate"
 ```
 
-Verify the candidate's checksums, manifest identity, and build-provenance
-attestation. The workflow attests the `.crate` itself, so point `gh attestation`
-at that file rather than at the Actions artifact ZIP.
+Verify the candidate's checksums, manifest identity, build-provenance
+attestation, and exact CycloneDX SBOM attestation. The workflow attests the
+`.crate` itself, so point `gh attestation` at that file rather than at the
+Actions artifact ZIP.
 
 ```sh
 RC_COMMIT="$(git -C "$release_root/source" rev-parse HEAD)"
@@ -207,6 +208,20 @@ gh attestation verify \
   --repo "$REPOSITORY" \
   --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
   --source-digest "$RC_COMMIT"
+
+sbom_attestation="$(mktemp)"
+gh attestation verify \
+  "$release_root/candidate/alternator-client-1.0.0.crate" \
+  --repo "$REPOSITORY" \
+  --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
+  --source-digest "$RC_COMMIT" \
+  --predicate-type https://cyclonedx.org/bom \
+  --format json >"$sbom_attestation"
+
+jq -e --slurpfile sbom \
+  "$release_root/candidate/alternator-client-1.0.0.cdx.json" \
+  'any(.[]; .verificationResult.statement.predicate == $sbom[0])' \
+  "$sbom_attestation" >/dev/null
 ```
 
 Install and select the exact release toolchain, regenerate the archive, and
