@@ -20,6 +20,9 @@ use flate2::read::{GzDecoder, GzEncoder, ZlibDecoder, ZlibEncoder};
 
 pub use flate2::Compression as CompressionLevel;
 
+pub(crate) const DEFAULT_MAX_RESPONSE_ENCODING_LAYERS: usize = 5;
+pub(crate) const DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CompressionAlgorithm {
@@ -147,25 +150,33 @@ pub(crate) fn accept_encoding_header_value(algorithms: &[ResponseCompressionAlgo
         .join(", ")
 }
 
-/// Configures which response encodings the client advertises via `Accept-Encoding`.
+/// Configures response compression negotiation and decompression limits.
 ///
-/// This only controls what the client *requests* from the server.
-/// The server may still return uncompressed responses regardless of this setting.
-/// Response decompression itself is based on the `Content-Encoding` header
-/// and is independent of this configuration.
+/// Accepted encodings control what the client requests from the server. The server
+/// may still return uncompressed responses regardless of this setting, and the
+/// driver still decompresses supported `Content-Encoding` values when negotiation
+/// is disabled. Decompression limits apply in both cases.
 ///
 /// The accepted encodings are sent in order of preference.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponseCompression {
     accepted_algorithms: Option<Vec<ResponseCompressionAlgorithm>>,
+    max_encoding_layers: usize,
+    max_decompressed_bytes: usize,
 }
 
 impl ResponseCompression {
+    fn new(accepted_algorithms: Option<Vec<ResponseCompressionAlgorithm>>) -> Self {
+        Self {
+            accepted_algorithms,
+            max_encoding_layers: DEFAULT_MAX_RESPONSE_ENCODING_LAYERS,
+            max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES,
+        }
+    }
+
     /// Advertise a single accepted encoding.
     pub fn enabled(algorithm: ResponseCompressionAlgorithm) -> Self {
-        Self {
-            accepted_algorithms: Some(vec![algorithm]),
-        }
+        Self::new(Some(vec![algorithm]))
     }
 
     /// Advertise multiple accepted encodings in order of preference.
@@ -184,29 +195,50 @@ impl ResponseCompression {
         if seen.is_empty() {
             Self::enabled_all()
         } else {
-            Self {
-                accepted_algorithms: Some(seen),
-            }
+            Self::new(Some(seen))
         }
     }
 
     /// Advertise all supported response encodings.
     pub fn enabled_all() -> Self {
-        Self {
-            accepted_algorithms: Some(ResponseCompressionAlgorithm::all().to_vec()),
-        }
+        Self::new(Some(ResponseCompressionAlgorithm::all().to_vec()))
     }
 
     /// Do not advertise any accepted response encoding.
     pub fn disabled() -> Self {
-        Self {
-            accepted_algorithms: None,
-        }
+        Self::new(None)
+    }
+
+    /// Set the maximum number of stacked `Content-Encoding` layers accepted in a response.
+    ///
+    /// The default is 5. A value of 0 rejects every encoded response.
+    pub fn with_max_encoding_layers(mut self, max_encoding_layers: usize) -> Self {
+        self.max_encoding_layers = max_encoding_layers;
+        self
+    }
+
+    /// Set the maximum number of bytes produced by each response decoding layer.
+    ///
+    /// The default is 32 MiB. Increase this when an Alternator deployment returns
+    /// larger legitimate responses. A value of 0 permits only empty decoded bodies.
+    pub fn with_max_decompressed_bytes(mut self, max_decompressed_bytes: usize) -> Self {
+        self.max_decompressed_bytes = max_decompressed_bytes;
+        self
     }
 
     /// Returns `None` if disabled, otherwise the ordered list of accepted algorithms.
     pub fn get(&self) -> Option<&[ResponseCompressionAlgorithm]> {
         self.accepted_algorithms.as_deref()
+    }
+
+    /// Returns the maximum accepted number of stacked response encoding layers.
+    pub fn max_encoding_layers(&self) -> usize {
+        self.max_encoding_layers
+    }
+
+    /// Returns the maximum number of bytes each response decoding layer may produce.
+    pub fn max_decompressed_bytes(&self) -> usize {
+        self.max_decompressed_bytes
     }
 }
 
@@ -438,6 +470,25 @@ mod tests {
     fn response_compression_default_is_disabled() {
         let rc = ResponseCompression::default();
         assert_eq!(rc.get(), None);
+        assert_eq!(
+            rc.max_encoding_layers(),
+            DEFAULT_MAX_RESPONSE_ENCODING_LAYERS
+        );
+        assert_eq!(
+            rc.max_decompressed_bytes(),
+            DEFAULT_MAX_DECOMPRESSED_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn response_compression_customizes_decompression_limits() {
+        let rc = ResponseCompression::disabled()
+            .with_max_encoding_layers(7)
+            .with_max_decompressed_bytes(64 * 1024 * 1024);
+
+        assert_eq!(rc.get(), None);
+        assert_eq!(rc.max_encoding_layers(), 7);
+        assert_eq!(rc.max_decompressed_bytes(), 64 * 1024 * 1024);
     }
 
     #[test]

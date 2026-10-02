@@ -182,8 +182,15 @@ impl Intercept for AlternatorInterceptor {
         &self,
         context: &mut BeforeDeserializationInterceptorContextMut<'_>,
         _: &RuntimeComponents,
-        _cfg: &mut ConfigBag,
+        cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
+        let response_compression = cfg
+            .interceptor_state()
+            .load::<ResponseCompressionStore>()
+            .map(|store| &store.response_compression)
+            .unwrap_or(&self.response_compression);
+        let max_encoding_layers = response_compression.max_encoding_layers();
+        let max_decompressed_bytes = response_compression.max_decompressed_bytes();
         let response = context.response_mut();
 
         // Collect all Content-Encoding header values (may be repeated headers
@@ -194,6 +201,10 @@ impl Intercept for AlternatorInterceptor {
                 if token.is_empty() {
                     continue;
                 }
+                crate::decompression::validate_response_encoding_layer_count(
+                    algorithms.len() + 1,
+                    max_encoding_layers,
+                )?;
                 match ResponseCompressionAlgorithm::from_content_encoding(token) {
                     Some(algo) => algorithms.push(algo),
                     None => {
@@ -216,7 +227,12 @@ impl Intercept for AlternatorInterceptor {
             response.body_mut(),
             aws_smithy_types::body::SdkBody::empty(),
         );
-        let decompressed_body = crate::decompression::wrap_decompressed_body(body, algorithms)?;
+        let decompressed_body = crate::decompression::wrap_decompressed_body(
+            body,
+            algorithms,
+            max_encoding_layers,
+            max_decompressed_bytes,
+        )?;
         *response.body_mut() = decompressed_body;
 
         // Strip Content-Encoding and Content-Length headers
