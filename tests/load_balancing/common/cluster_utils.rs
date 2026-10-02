@@ -55,7 +55,8 @@ pub(crate) async fn get_cluster() -> MutexGuard<'static, Cluster> {
                 .unwrap();
             let ip_prefix = IpPrefix::new("127.0.1.").unwrap();
             let cluster_name = format!("test_cluster_{}", uuid::Uuid::new_v4());
-            let scylla_version = String::from("release:2025.1");
+            let scylla_version = std::env::var("CCM_SCYLLA_VERSION")
+                .unwrap_or_else(|_| String::from("release:2025.1.16"));
             let cluster = Ccm::create_cluster(
                 cluster_name,
                 &topology,

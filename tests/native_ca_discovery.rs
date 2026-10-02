@@ -102,16 +102,16 @@ fn assert_tls_outcomes(outcomes: &[BuildOutcome; 5]) {
 #[test]
 fn unusable_native_roots_fail_https_construction_without_panicking() {
     let missing_path = std::env::temp_dir().join(format!(
-        "alternator-driver-missing-ca-{}",
+        "alternator-client-missing-ca-{}",
         uuid::Uuid::new_v4()
     ));
     assert!(!missing_path.exists());
     let empty_file = std::env::temp_dir().join(format!(
-        "alternator-driver-empty-ca-{}",
+        "alternator-client-empty-ca-{}",
         uuid::Uuid::new_v4()
     ));
     let empty_dir = std::env::temp_dir().join(format!(
-        "alternator-driver-empty-ca-dir-{}",
+        "alternator-client-empty-ca-dir-{}",
         uuid::Uuid::new_v4()
     ));
     std::fs::write(&empty_file, []).unwrap();
