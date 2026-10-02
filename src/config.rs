@@ -775,6 +775,8 @@ impl AlternatorConfig {
         self.dynamodb_config.stalled_stream_protection()
     }
 
+    /// Returns the HTTP client used for both Alternator API requests and
+    /// live-node discovery.
     pub fn http_client(&self) -> Option<aws_sdk_dynamodb::config::SharedHttpClient> {
         self.dynamodb_config.http_client()
     }
@@ -882,6 +884,11 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Configures the HTTP client used for both Alternator API requests and
+    /// live-node discovery.
+    ///
+    /// This lets custom transport settings, including TLS trust stores and
+    /// client certificates, apply consistently to `/localnodes` requests.
     pub fn http_client(
         mut self,
         http_client: impl aws_sdk_dynamodb::config::HttpClient + 'static,
@@ -890,6 +897,8 @@ impl AlternatorBuilder {
         self
     }
 
+    /// Sets the HTTP client used for both Alternator API requests and
+    /// live-node discovery.
     pub fn set_http_client(
         &mut self,
         http_client: Option<aws_sdk_dynamodb::config::SharedHttpClient>,

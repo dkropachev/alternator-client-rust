@@ -22,7 +22,9 @@
 //! nodes in a random order to get an updated list of live nodes. After a
 //! successful refresh, the list is updated to nodes from the highest available
 //! scope in the fallback chain provided by the user.
-//! Underneath it uses a basic [`reqwest::Client`] with timeouts.
+//! Discovery reuses a configured AWS SDK HTTP client so custom transport and
+//! TLS settings also apply to `/localnodes`. Without one, it uses a basic
+//! [`reqwest::Client`] with timeouts and native CA roots.
 //!
 //! # Polling cadence
 //!
@@ -100,6 +102,11 @@
 
 use crate::routing_scope::RoutingScope;
 use arc_swap::{ArcSwap, ArcSwapOption};
+use aws_sdk_dynamodb::config::{SharedAsyncSleep, SharedHttpClient};
+use aws_smithy_async::time::SharedTimeSource;
+use aws_smithy_runtime::client::orchestrator::operation::Operation;
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, OrchestratorError};
+use aws_smithy_types::timeout::TimeoutConfig;
 use futures_util::FutureExt;
 use rand::seq::SliceRandom;
 use std::collections::{HashMap, VecDeque};
@@ -232,16 +239,98 @@ fn unusable_native_roots_message(errors: Vec<String>) -> String {
     }
 }
 
-fn build_discovery_http_client(
+fn build_default_discovery_http_client(
     scheme: &str,
-) -> Result<(reqwest::Client, bool), LiveNodesBuildError> {
+) -> Result<(DiscoveryHttpClient, bool), LiveNodesBuildError> {
     let (builder, native_roots_usable) = discovery_http_client_builder_with_root_status(scheme)?;
     let client = builder
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_secs(2))
         .build()
         .map_err(LiveNodesBuildError::HttpClient)?;
-    Ok((client, native_roots_usable))
+    Ok((DiscoveryHttpClient::Reqwest(client), native_roots_usable))
+}
+
+fn build_discovery_http_client(
+    config: &crate::config::AlternatorConfig,
+    scheme: &str,
+) -> Result<(DiscoveryHttpClient, bool), LiveNodesBuildError> {
+    match config.http_client() {
+        Some(http_client) => Ok((
+            DiscoveryHttpClient::Smithy {
+                http_client,
+                sleep_impl: config.sleep_impl(),
+                time_source: config.time_source(),
+            },
+            false,
+        )),
+        None => build_default_discovery_http_client(scheme),
+    }
+}
+
+#[derive(Debug)]
+enum DiscoveryHttpClient {
+    Reqwest(reqwest::Client),
+    Smithy {
+        http_client: SharedHttpClient,
+        sleep_impl: Option<SharedAsyncSleep>,
+        time_source: Option<SharedTimeSource>,
+    },
+}
+
+impl DiscoveryHttpClient {
+    async fn get_live_nodes(&self, url: &Url) -> Option<Vec<String>> {
+        match self {
+            Self::Reqwest(client) => client
+                .get(url.clone())
+                .send()
+                .await
+                .ok()?
+                .json::<Vec<String>>()
+                .await
+                .ok(),
+            Self::Smithy {
+                http_client,
+                sleep_impl,
+                time_source,
+            } => {
+                let endpoint_url = url.origin().ascii_serialization();
+                let mut builder = Operation::builder()
+                    .service_name("alternator")
+                    .operation_name("DiscoverLiveNodes")
+                    .behavior_version(crate::config::ALTERNATOR_BEHAVIOR_VERSION())
+                    .http_client(http_client.clone())
+                    .endpoint_url(&endpoint_url)
+                    .no_auth()
+                    .no_retry()
+                    .timeout_config(
+                        TimeoutConfig::builder()
+                            .connect_timeout(Duration::from_secs(2))
+                            .operation_timeout(Duration::from_secs(5))
+                            .build(),
+                    )
+                    .with_connection_poisoning();
+                if let Some(sleep_impl) = sleep_impl {
+                    builder = builder.sleep_impl(sleep_impl.clone());
+                }
+                if let Some(time_source) = time_source {
+                    builder = builder.time_source(time_source.clone());
+                }
+                builder
+                    .serializer(|url: Url| HttpRequest::get(url.as_str()).map_err(Into::into))
+                    .deserializer::<_, std::convert::Infallible>(|response| {
+                        let body = response.body().bytes().ok_or_else(|| {
+                            OrchestratorError::other("discovery response body was not buffered")
+                        })?;
+                        serde_json::from_slice(body).map_err(OrchestratorError::other)
+                    })
+                    .build()
+                    .invoke(url.clone())
+                    .await
+                    .ok()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -255,7 +344,7 @@ pub(crate) struct LiveNodes {
     seed_urls: Vec<Arc<Url>>,
     alternator_scheme: String,
     port: Option<u16>,
-    client: reqwest::Client,
+    client: DiscoveryHttpClient,
     native_roots_usable: bool,
     last_activity: Arc<Mutex<Instant>>,
     notify: Arc<tokio::sync::Notify>,
@@ -518,7 +607,8 @@ impl LiveNodes {
             })
             .collect::<Result<Vec<_>, _>>()?;
         seed_urls.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-        let (client, native_roots_usable) = build_discovery_http_client(seed_urls[0].scheme())?;
+        let (client, native_roots_usable) =
+            build_discovery_http_client(config, seed_urls[0].scheme())?;
 
         Ok(Some(Arc::new(Self {
             routing_scope,
@@ -557,15 +647,7 @@ impl LiveNodes {
         node_addr: &Url,
     ) -> Option<Vec<Arc<Url>>> {
         let url = scope.build_localnodes_url(node_addr.clone());
-        let mut nodes = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .ok()?
-            .json::<Vec<String>>()
-            .await
-            .ok()?;
+        let mut nodes = self.client.get_live_nodes(&url).await?;
 
         nodes.sort();
         Some(
@@ -952,6 +1034,13 @@ impl Drop for LiveNodes {
 mod tests {
     use super::*;
     use crate::config::AlternatorConfig;
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use aws_smithy_runtime_api::http::StatusCode;
+    use aws_smithy_types::body::SdkBody;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -996,8 +1085,56 @@ mod tests {
             .build()
     }
 
+    #[derive(Clone, Debug)]
+    struct DiscoveryResponseHttpClient(Arc<Mutex<Vec<String>>>);
+
+    impl HttpClient for DiscoveryResponseHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for DiscoveryResponseHttpClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", request.method(), request.uri()));
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                StatusCode::try_from(200).unwrap(),
+                SdkBody::from(r#"["127.0.0.2"]"#),
+            )))
+        }
+    }
+
     async fn start_localnodes_server(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
         start_localnodes_server_on("127.0.0.1:0", "localhost", body).await
+    }
+
+    #[tokio::test]
+    async fn custom_http_client_is_used_for_discovery() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let config = AlternatorConfig::builder()
+            .seed_hosts(["127.0.0.1"])
+            .port(8000)
+            .http_client(DiscoveryResponseHttpClient(requests.clone()))
+            .build();
+        let nodes = LiveNodes::new(&config).unwrap();
+
+        nodes.update_live_nodes().await;
+
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET http://127.0.0.1:8000/localnodes"]
+        );
+        assert_eq!(
+            nodes.live_nodes.load()[0].as_str(),
+            "http://127.0.0.2:8000/"
+        );
     }
 
     async fn start_localnodes_server_on(
@@ -2165,19 +2302,21 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
             ],
         );
-        Arc::get_mut(&mut nodes).unwrap().client = discovery_http_client_builder("http")
-            .unwrap()
-            .timeout(Duration::from_millis(200))
-            .connect_timeout(Duration::from_millis(100))
-            .resolve_to_addrs(
-                "dual.test",
-                &[
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
-                ],
-            )
-            .build()
-            .unwrap();
+        Arc::get_mut(&mut nodes).unwrap().client = DiscoveryHttpClient::Reqwest(
+            discovery_http_client_builder("http")
+                .unwrap()
+                .timeout(Duration::from_millis(200))
+                .connect_timeout(Duration::from_millis(100))
+                .resolve_to_addrs(
+                    "dual.test",
+                    &[
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                    ],
+                )
+                .build()
+                .unwrap(),
+        );
 
         tokio::time::timeout(Duration::from_secs(1), nodes.update_live_nodes())
             .await
@@ -2261,13 +2400,15 @@ mod tests {
             .iter()
             .map(|ip| SocketAddr::new(*ip, port))
             .collect::<Vec<_>>();
-        Arc::get_mut(&mut nodes).unwrap().client = discovery_http_client_builder("http")
-            .unwrap()
-            .timeout(Duration::from_secs(1))
-            .connect_timeout(Duration::from_millis(500))
-            .resolve_to_addrs("dual.test", &addresses)
-            .build()
-            .unwrap();
+        Arc::get_mut(&mut nodes).unwrap().client = DiscoveryHttpClient::Reqwest(
+            discovery_http_client_builder("http")
+                .unwrap()
+                .timeout(Duration::from_secs(1))
+                .connect_timeout(Duration::from_millis(500))
+                .resolve_to_addrs("dual.test", &addresses)
+                .build()
+                .unwrap(),
+        );
         nodes
     }
 }

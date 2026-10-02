@@ -17,7 +17,7 @@ use std::path::Path;
 
 type BuildOutcome = Result<(), String>;
 
-fn build_with_native_ca_paths(cert_file: &Path, cert_dir: &Path) -> [BuildOutcome; 4] {
+fn build_with_native_ca_paths(cert_file: &Path, cert_dir: &Path) -> [BuildOutcome; 5] {
     // SAFETY: This integration-test binary contains one test, and no work is
     // spawned before these variables are restored below.
     unsafe {
@@ -37,6 +37,14 @@ fn build_with_native_ca_paths(cert_file: &Path, cert_dir: &Path) -> [BuildOutcom
             .scheme("https")
             .port(8043)
             .seed_hosts(["127.0.0.1"])
+            .build(),
+    );
+    let custom_https_discovery = AlternatorClient::try_from_conf(
+        AlternatorConfig::builder()
+            .scheme("https")
+            .port(8043)
+            .seed_hosts(["127.0.0.1"])
+            .http_client(aws_smithy_http_client::Builder::new().build_http())
             .build(),
     );
     let direct_https = AlternatorClient::try_from_conf(
@@ -60,13 +68,14 @@ fn build_with_native_ca_paths(cert_file: &Path, cert_dir: &Path) -> [BuildOutcom
     [
         http_discovery,
         https_discovery,
+        custom_https_discovery,
         direct_https,
         custom_direct_https,
     ]
     .map(|outcome| outcome.map(|_| ()).map_err(|error| error.to_string()))
 }
 
-fn assert_tls_outcomes(outcomes: &[BuildOutcome; 4]) {
+fn assert_tls_outcomes(outcomes: &[BuildOutcome; 5]) {
     assert!(outcomes[0].is_ok(), "{:?}", outcomes[0]);
 
     let discovery_error = outcomes[1]
@@ -77,7 +86,9 @@ fn assert_tls_outcomes(outcomes: &[BuildOutcome; 4]) {
         "{discovery_error}"
     );
 
-    let direct_error = outcomes[2]
+    assert!(outcomes[2].is_ok(), "{:?}", outcomes[2]);
+
+    let direct_error = outcomes[3]
         .as_ref()
         .expect_err("direct HTTPS must reject unusable native roots");
     assert!(
@@ -85,7 +96,7 @@ fn assert_tls_outcomes(outcomes: &[BuildOutcome; 4]) {
         "{direct_error}"
     );
 
-    assert!(outcomes[3].is_ok(), "{:?}", outcomes[3]);
+    assert!(outcomes[4].is_ok(), "{:?}", outcomes[4]);
 }
 
 #[test]

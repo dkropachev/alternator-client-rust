@@ -116,6 +116,8 @@ The driver does not expose AWS custom auth schemes, auth scheme resolvers, auth 
 
 Advanced SDK knobs such as retry settings, timeout settings, HTTP clients, identity cache, framework metadata, and interceptors remain available as escape hatches. Framework metadata is passed through to the underlying DynamoDB config for SDK integrations, while `user_agent(...)` controls the driver's final Alternator client identification. Interceptors run alongside the driver's routing, compression, decompression, and header optimization interceptors, so keep ordering effects in mind when using them.
 
+A configured HTTP client is also used for `/localnodes` discovery, so custom TLS trust stores, client certificates, proxies, and other transport settings apply to both discovery and regular Alternator API requests.
+
 Operation builders are DynamoDB SDK passthroughs for source compatibility, but Alternator support is server-dependent. AWS-only surfaces such as backup/PITR/export/import, global tables, Kinesis streaming destinations, contributor insights, resource policies, tagging, `describe_endpoints`, `describe_limits`, PartiQL, and replica auto-scaling may fail against Alternator unless the server explicitly supports them.
 
 ## Load balancing
