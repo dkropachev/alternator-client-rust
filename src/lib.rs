@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Client-side discovery and load balancing for ScyllaDB Alternator.
+//!
+//! This crate wraps the AWS SDK for DynamoDB with Alternator-specific configuration,
+//! node discovery, request routing, compression, and optional key-route affinity.
+//! Build an [`AlternatorConfig`] with [`AlternatorConfig::builder`], then create an
+//! [`AlternatorClient`] to access DynamoDB operation builders.
+
+#![warn(missing_docs)]
+
 mod client;
 mod compression;
 mod config;

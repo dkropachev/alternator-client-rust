@@ -17,6 +17,11 @@
 //! Routing scopes allow user to specify which nodes should be used for load balancing,
 //! with optional fallback to a wider scope if no nodes are available in the preferred one.
 
+/// Selects the preferred cluster nodes and an optional fallback chain for routing.
+///
+/// A scope can target the whole cluster, one datacenter, or one rack within a
+/// datacenter. If no live nodes exist in that scope, the client tries each
+/// scope added with [`Self::with_fallback`] in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingScope {
     dc: Option<String>,
@@ -39,6 +44,9 @@ impl RoutingScope {
         }
     }
 
+    /// Routes requests to nodes in `dc`.
+    ///
+    /// An empty datacenter name is treated as [`Self::from_cluster`].
     pub fn from_datacenter(dc: String) -> Self {
         if dc.is_empty() {
             Self::from_cluster()
@@ -50,6 +58,10 @@ impl RoutingScope {
         }
     }
 
+    /// Routes requests to nodes in `rack` within `dc`.
+    ///
+    /// An empty datacenter name is treated as [`Self::from_cluster`]. An empty
+    /// rack name is treated as [`Self::from_datacenter`].
     pub fn from_rack(dc: String, rack: String) -> Self {
         if dc.is_empty() {
             Self::from_cluster()
@@ -103,14 +115,17 @@ impl RoutingScope {
         self.dc.is_none() && self.rack.is_none()
     }
 
+    /// Returns the next scope in the fallback chain, if one is configured.
     pub fn fallback(&self) -> Option<&RoutingScope> {
         self.fallback.as_deref()
     }
 
+    /// Returns the targeted datacenter, or [`None`] for cluster-wide routing.
     pub fn dc(&self) -> Option<&str> {
         self.dc.as_deref()
     }
 
+    /// Returns the targeted rack, or [`None`] when routing is not rack-specific.
     pub fn rack(&self) -> Option<&str> {
         self.rack.as_deref()
     }

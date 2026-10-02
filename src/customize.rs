@@ -77,6 +77,10 @@ use aws_sdk_dynamodb::client::customize::CustomizableOperation;
 ///     .alternator_config_override(AlternatorConfig::builder());
 /// ```
 pub trait AlternatorCustomizableOperation<T, E, B> {
+    /// Applies Alternator-specific settings to this operation.
+    ///
+    /// The override affects only this operation and currently supports request
+    /// and response compression settings from an [`AlternatorOperationBuilder`].
     fn alternator_config_override(
         self,
         config_override: impl Into<AlternatorOperationBuilder>,

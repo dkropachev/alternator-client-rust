@@ -502,6 +502,7 @@ impl AlternatorClient {
         })
     }
 
+    /// Returns the configuration used to construct this client.
     pub fn config(&self) -> &AlternatorConfig {
         &self.config
     }
@@ -510,28 +511,33 @@ impl AlternatorClient {
 // All implementations below this point should only be simple wrappers around dynamodb methods
 
 impl AlternatorClient {
+    /// Constructs a fluent builder for the DynamoDB `BatchExecuteStatement` operation.
     pub fn batch_execute_statement(&self) -> aws_sdk_dynamodb::operation::batch_execute_statement::builders::BatchExecuteStatementFluentBuilder{
         self.dynamodb_client.batch_execute_statement()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `BatchGetItem` operation.
     pub fn batch_get_item(
         &self,
     ) -> aws_sdk_dynamodb::operation::batch_get_item::builders::BatchGetItemFluentBuilder {
         self.dynamodb_client.batch_get_item()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `BatchWriteItem` operation.
     pub fn batch_write_item(
         &self,
     ) -> aws_sdk_dynamodb::operation::batch_write_item::builders::BatchWriteItemFluentBuilder {
         self.dynamodb_client.batch_write_item()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `CreateBackup` operation.
     pub fn create_backup(
         &self,
     ) -> aws_sdk_dynamodb::operation::create_backup::builders::CreateBackupFluentBuilder {
         self.dynamodb_client.create_backup()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `CreateGlobalTable` operation.
     pub fn create_global_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::create_global_table::builders::CreateGlobalTableFluentBuilder
@@ -539,50 +545,59 @@ impl AlternatorClient {
         self.dynamodb_client.create_global_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `CreateTable` operation.
     pub fn create_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::create_table::builders::CreateTableFluentBuilder {
         self.dynamodb_client.create_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DeleteBackup` operation.
     pub fn delete_backup(
         &self,
     ) -> aws_sdk_dynamodb::operation::delete_backup::builders::DeleteBackupFluentBuilder {
         self.dynamodb_client.delete_backup()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DeleteItem` operation.
     pub fn delete_item(
         &self,
     ) -> aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder {
         self.dynamodb_client.delete_item()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DeleteResourcePolicy` operation.
     pub fn delete_resource_policy(&self) -> aws_sdk_dynamodb::operation::delete_resource_policy::builders::DeleteResourcePolicyFluentBuilder{
         self.dynamodb_client.delete_resource_policy()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DeleteTable` operation.
     pub fn delete_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::delete_table::builders::DeleteTableFluentBuilder {
         self.dynamodb_client.delete_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeBackup` operation.
     pub fn describe_backup(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_backup::builders::DescribeBackupFluentBuilder {
         self.dynamodb_client.describe_backup()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeContinuousBackups` operation.
     pub fn describe_continuous_backups(&self) -> aws_sdk_dynamodb::operation::describe_continuous_backups::builders::DescribeContinuousBackupsFluentBuilder{
         self.dynamodb_client.describe_continuous_backups()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeContributorInsights` operation.
 	pub fn describe_contributor_insights(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_contributor_insights::builders::DescribeContributorInsightsFluentBuilder{
         self.dynamodb_client.describe_contributor_insights()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeEndpoints` operation.
     pub fn describe_endpoints(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_endpoints::builders::DescribeEndpointsFluentBuilder
@@ -590,28 +605,33 @@ impl AlternatorClient {
         self.dynamodb_client.describe_endpoints()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeExport` operation.
     pub fn describe_export(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_export::builders::DescribeExportFluentBuilder {
         self.dynamodb_client.describe_export()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeGlobalTable` operation.
     pub fn describe_global_table(&self) -> aws_sdk_dynamodb::operation::describe_global_table::builders::DescribeGlobalTableFluentBuilder{
         self.dynamodb_client.describe_global_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeGlobalTableSettings` operation.
 	pub fn describe_global_table_settings(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_global_table_settings::builders::DescribeGlobalTableSettingsFluentBuilder{
         self.dynamodb_client.describe_global_table_settings()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeImport` operation.
     pub fn describe_import(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_import::builders::DescribeImportFluentBuilder {
         self.dynamodb_client.describe_import()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeKinesisStreamingDestination` operation.
 	pub fn describe_kinesis_streaming_destination(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_kinesis_streaming_destination::builders::DescribeKinesisStreamingDestinationFluentBuilder{
@@ -619,24 +639,28 @@ impl AlternatorClient {
             .describe_kinesis_streaming_destination()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeLimits` operation.
     pub fn describe_limits(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_limits::builders::DescribeLimitsFluentBuilder {
         self.dynamodb_client.describe_limits()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeTable` operation.
     pub fn describe_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_table::builders::DescribeTableFluentBuilder {
         self.dynamodb_client.describe_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeTableReplicaAutoScaling` operation.
 	pub fn describe_table_replica_auto_scaling(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_table_replica_auto_scaling::builders::DescribeTableReplicaAutoScalingFluentBuilder{
         self.dynamodb_client.describe_table_replica_auto_scaling()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DescribeTimeToLive` operation.
     pub fn describe_time_to_live(
         &self,
     ) -> aws_sdk_dynamodb::operation::describe_time_to_live::builders::DescribeTimeToLiveFluentBuilder
@@ -644,18 +668,21 @@ impl AlternatorClient {
         self.dynamodb_client.describe_time_to_live()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `DisableKinesisStreamingDestination` operation.
 	pub fn disable_kinesis_streaming_destination(
         &self,
     ) -> aws_sdk_dynamodb::operation::disable_kinesis_streaming_destination::builders::DisableKinesisStreamingDestinationFluentBuilder{
         self.dynamodb_client.disable_kinesis_streaming_destination()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `EnableKinesisStreamingDestination` operation.
 	pub fn enable_kinesis_streaming_destination(
         &self,
     ) -> aws_sdk_dynamodb::operation::enable_kinesis_streaming_destination::builders::EnableKinesisStreamingDestinationFluentBuilder{
         self.dynamodb_client.enable_kinesis_streaming_destination()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ExecuteStatement` operation.
     pub fn execute_statement(
         &self,
     ) -> aws_sdk_dynamodb::operation::execute_statement::builders::ExecuteStatementFluentBuilder
@@ -663,6 +690,7 @@ impl AlternatorClient {
         self.dynamodb_client.execute_statement()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ExecuteTransaction` operation.
     pub fn execute_transaction(
         &self,
     ) -> aws_sdk_dynamodb::operation::execute_transaction::builders::ExecuteTransactionFluentBuilder
@@ -670,16 +698,19 @@ impl AlternatorClient {
         self.dynamodb_client.execute_transaction()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ExportTableToPointInTime` operation.
     pub fn export_table_to_point_in_time(&self) -> aws_sdk_dynamodb::operation::export_table_to_point_in_time::builders::ExportTableToPointInTimeFluentBuilder{
         self.dynamodb_client.export_table_to_point_in_time()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `GetItem` operation.
     pub fn get_item(
         &self,
     ) -> aws_sdk_dynamodb::operation::get_item::builders::GetItemFluentBuilder {
         self.dynamodb_client.get_item()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `GetResourcePolicy` operation.
     pub fn get_resource_policy(
         &self,
     ) -> aws_sdk_dynamodb::operation::get_resource_policy::builders::GetResourcePolicyFluentBuilder
@@ -687,28 +718,33 @@ impl AlternatorClient {
         self.dynamodb_client.get_resource_policy()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ImportTable` operation.
     pub fn import_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::import_table::builders::ImportTableFluentBuilder {
         self.dynamodb_client.import_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListBackups` operation.
     pub fn list_backups(
         &self,
     ) -> aws_sdk_dynamodb::operation::list_backups::builders::ListBackupsFluentBuilder {
         self.dynamodb_client.list_backups()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListContributorInsights` operation.
     pub fn list_contributor_insights(&self) -> aws_sdk_dynamodb::operation::list_contributor_insights::builders::ListContributorInsightsFluentBuilder{
         self.dynamodb_client.list_contributor_insights()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListExports` operation.
     pub fn list_exports(
         &self,
     ) -> aws_sdk_dynamodb::operation::list_exports::builders::ListExportsFluentBuilder {
         self.dynamodb_client.list_exports()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListGlobalTables` operation.
     pub fn list_global_tables(
         &self,
     ) -> aws_sdk_dynamodb::operation::list_global_tables::builders::ListGlobalTablesFluentBuilder
@@ -716,18 +752,21 @@ impl AlternatorClient {
         self.dynamodb_client.list_global_tables()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListImports` operation.
     pub fn list_imports(
         &self,
     ) -> aws_sdk_dynamodb::operation::list_imports::builders::ListImportsFluentBuilder {
         self.dynamodb_client.list_imports()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListTables` operation.
     pub fn list_tables(
         &self,
     ) -> aws_sdk_dynamodb::operation::list_tables::builders::ListTablesFluentBuilder {
         self.dynamodb_client.list_tables()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `ListTagsOfResource` operation.
     pub fn list_tags_of_resource(
         &self,
     ) -> aws_sdk_dynamodb::operation::list_tags_of_resource::builders::ListTagsOfResourceFluentBuilder
@@ -735,12 +774,14 @@ impl AlternatorClient {
         self.dynamodb_client.list_tags_of_resource()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `PutItem` operation.
     pub fn put_item(
         &self,
     ) -> aws_sdk_dynamodb::operation::put_item::builders::PutItemFluentBuilder {
         self.dynamodb_client.put_item()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `PutResourcePolicy` operation.
     pub fn put_resource_policy(
         &self,
     ) -> aws_sdk_dynamodb::operation::put_resource_policy::builders::PutResourcePolicyFluentBuilder
@@ -748,30 +789,36 @@ impl AlternatorClient {
         self.dynamodb_client.put_resource_policy()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `Query` operation.
     pub fn query(&self) -> aws_sdk_dynamodb::operation::query::builders::QueryFluentBuilder {
         self.dynamodb_client.query()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `RestoreTableFromBackup` operation.
     pub fn restore_table_from_backup(&self) -> aws_sdk_dynamodb::operation::restore_table_from_backup::builders::RestoreTableFromBackupFluentBuilder{
         self.dynamodb_client.restore_table_from_backup()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `RestoreTableToPointInTime` operation.
 	pub fn restore_table_to_point_in_time(
         &self,
     ) -> aws_sdk_dynamodb::operation::restore_table_to_point_in_time::builders::RestoreTableToPointInTimeFluentBuilder{
         self.dynamodb_client.restore_table_to_point_in_time()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `Scan` operation.
     pub fn scan(&self) -> aws_sdk_dynamodb::operation::scan::builders::ScanFluentBuilder {
         self.dynamodb_client.scan()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `TagResource` operation.
     pub fn tag_resource(
         &self,
     ) -> aws_sdk_dynamodb::operation::tag_resource::builders::TagResourceFluentBuilder {
         self.dynamodb_client.tag_resource()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `TransactGetItems` operation.
     pub fn transact_get_items(
         &self,
     ) -> aws_sdk_dynamodb::operation::transact_get_items::builders::TransactGetItemsFluentBuilder
@@ -779,6 +826,7 @@ impl AlternatorClient {
         self.dynamodb_client.transact_get_items()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `TransactWriteItems` operation.
     pub fn transact_write_items(
         &self,
     ) -> aws_sdk_dynamodb::operation::transact_write_items::builders::TransactWriteItemsFluentBuilder
@@ -786,20 +834,24 @@ impl AlternatorClient {
         self.dynamodb_client.transact_write_items()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UntagResource` operation.
     pub fn untag_resource(
         &self,
     ) -> aws_sdk_dynamodb::operation::untag_resource::builders::UntagResourceFluentBuilder {
         self.dynamodb_client.untag_resource()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateContinuousBackups` operation.
     pub fn update_continuous_backups(&self) -> aws_sdk_dynamodb::operation::update_continuous_backups::builders::UpdateContinuousBackupsFluentBuilder{
         self.dynamodb_client.update_continuous_backups()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateContributorInsights` operation.
     pub fn update_contributor_insights(&self) -> aws_sdk_dynamodb::operation::update_contributor_insights::builders::UpdateContributorInsightsFluentBuilder{
         self.dynamodb_client.update_contributor_insights()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateGlobalTable` operation.
     pub fn update_global_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::update_global_table::builders::UpdateGlobalTableFluentBuilder
@@ -807,34 +859,40 @@ impl AlternatorClient {
         self.dynamodb_client.update_global_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateGlobalTableSettings` operation.
     pub fn update_global_table_settings(&self) -> aws_sdk_dynamodb::operation::update_global_table_settings::builders::UpdateGlobalTableSettingsFluentBuilder{
         self.dynamodb_client.update_global_table_settings()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateItem` operation.
     pub fn update_item(
         &self,
     ) -> aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder {
         self.dynamodb_client.update_item()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateKinesisStreamingDestination` operation.
 	pub fn update_kinesis_streaming_destination(
         &self,
     ) -> aws_sdk_dynamodb::operation::update_kinesis_streaming_destination::builders::UpdateKinesisStreamingDestinationFluentBuilder{
         self.dynamodb_client.update_kinesis_streaming_destination()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateTable` operation.
     pub fn update_table(
         &self,
     ) -> aws_sdk_dynamodb::operation::update_table::builders::UpdateTableFluentBuilder {
         self.dynamodb_client.update_table()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateTableReplicaAutoScaling` operation.
 	pub fn update_table_replica_auto_scaling(
         &self,
     ) -> aws_sdk_dynamodb::operation::update_table_replica_auto_scaling::builders::UpdateTableReplicaAutoScalingFluentBuilder{
         self.dynamodb_client.update_table_replica_auto_scaling()
     }
 
+    /// Constructs a fluent builder for the DynamoDB `UpdateTimeToLive` operation.
     pub fn update_time_to_live(
         &self,
     ) -> aws_sdk_dynamodb::operation::update_time_to_live::builders::UpdateTimeToLiveFluentBuilder
