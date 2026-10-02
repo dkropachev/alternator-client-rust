@@ -1111,6 +1111,50 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct CoordinatedDiscoveryHttpClient {
+        stalled: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl HttpClient for CoordinatedDiscoveryHttpClient {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    impl HttpConnector for CoordinatedDiscoveryHttpClient {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            assert_eq!(request.method(), "GET");
+
+            match request.uri() {
+                "http://responsive.test/localnodes" => {
+                    HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                        StatusCode::try_from(200).unwrap(),
+                        SdkBody::from(r#"["healthy.test"]"#),
+                    )))
+                }
+                "http://stale.test/localnodes" => {
+                    let stalled = self.stalled.clone();
+                    let release = self.release.clone();
+                    HttpConnectorFuture::new(async move {
+                        stalled.notify_one();
+                        release.notified().await;
+                        Ok(HttpResponse::new(
+                            StatusCode::try_from(200).unwrap(),
+                            SdkBody::from("[]"),
+                        ))
+                    })
+                }
+                uri => panic!("unexpected discovery request URI: {uri}"),
+            }
+        }
+    }
+
     async fn start_localnodes_server(body: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
         start_localnodes_server_on("127.0.0.1:0", "localhost", body).await
     }
@@ -2134,51 +2178,20 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_discovery_publishes_safe_partial_union_before_stalled_candidate_finishes() {
-        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
         let stalled = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let server_stalled = stalled.clone();
-        let server_release = release.clone();
-        let server = tokio::spawn(async move {
-            let (mut responsive, _) = listener.accept().await.unwrap();
-            let mut buffer = [0; 1024];
-            let n = responsive.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..n]);
-            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
-            assert!(
-                request.contains(&format!("host: 127.0.0.1:{port}"))
-                    || request.contains(&format!("Host: 127.0.0.1:{port}"))
-            );
-
-            let body = r#"["127.0.0.3"]"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            responsive.write_all(response.as_bytes()).await.unwrap();
-
-            let (mut blackhole, _) = listener.accept().await.unwrap();
-            let n = blackhole.read(&mut buffer).await.unwrap();
-            let request = String::from_utf8_lossy(&buffer[..n]);
-            assert!(request.starts_with("GET /localnodes HTTP/1.1"));
-            assert!(
-                request.contains(&format!("host: 127.0.0.2:{port}"))
-                    || request.contains(&format!("Host: 127.0.0.2:{port}"))
-            );
-            server_stalled.notify_one();
-            server_release.notified().await;
-        });
 
         let config = AlternatorConfig::builder()
             .scheme("http")
-            .port(port)
-            .seed_hosts(["127.0.0.1"])
+            .seed_hosts(["responsive.test"])
+            .http_client(CoordinatedDiscoveryHttpClient {
+                stalled: stalled.clone(),
+                release: release.clone(),
+            })
             .build();
         let nodes = LiveNodes::new(&config).unwrap();
-        let stale = Arc::new(Url::parse(&format!("http://127.0.0.2:{port}/")).unwrap());
-        let healthy = Arc::new(Url::parse(&format!("http://127.0.0.3:{port}/")).unwrap());
+        let stale = Arc::new(Url::parse("http://stale.test/").unwrap());
+        let healthy = Arc::new(Url::parse("http://healthy.test/").unwrap());
         nodes.live_nodes.store(Arc::new(vec![stale.clone()]));
         let candidates = vec![nodes.seed_urls[0].clone(), stale.clone()];
         let generation = nodes.begin_refresh();
@@ -2198,7 +2211,7 @@ mod tests {
         );
         assert_eq!(
             nodes.live_nodes.load().as_ref(),
-            &[stale.clone(), healthy.clone()],
+            &[healthy.clone(), stale.clone()],
             "partial publication must add newly validated nodes without dropping last-known-good nodes"
         );
 
@@ -2208,7 +2221,6 @@ mod tests {
             .expect("cluster discovery did not finish after releasing the stale candidate")
             .unwrap()
             .unwrap();
-        server.await.unwrap();
         assert_eq!(discovered, vec![healthy]);
     }
 
