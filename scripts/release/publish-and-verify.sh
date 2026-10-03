@@ -15,20 +15,47 @@
 
 set -euo pipefail
 
-[[ $# -eq 3 ]] || {
-    echo "usage: $0 PACKAGE_DIR VERSION CANDIDATE_CRATE" >&2
+[[ $# -eq 6 ]] || {
+    echo "usage: $0 RELEASE_MODE PACKAGE_DIR VERSION CANDIDATE_ID COMMIT_SHA CANDIDATE_DIR" >&2
     exit 2
 }
 
-package_dir=$1
-version=$2
-candidate_crate=$3
+release_mode=$1
+package_dir=$2
+version=$3
+candidate_id=$4
+commit_sha=$5
+candidate_dir=$6
 package_name=alternator-client
+release_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+[[ "$release_mode" == release ]] || {
+    echo "publish requires release_mode=release" >&2
+    exit 1
+}
+
+"$release_script_dir/verify-candidate.sh" \
+    "$candidate_dir" "$(mktemp -d)" \
+    release "$version" "$candidate_id" "$commit_sha" >/dev/null
+manifest="$candidate_dir/release-manifest.json"
+crate_file=$(jq -er '.crate.file' "$manifest")
+candidate_crate="$candidate_dir/$crate_file"
+
+[[ "$(git -C "$package_dir" rev-parse HEAD)" == "$commit_sha" ]] || {
+    echo "publication checkout does not match candidate commit $commit_sha" >&2
+    exit 1
+}
+[[ -z "$(git -C "$package_dir" status --porcelain --untracked-files=all)" ]] || {
+    echo "publication checkout is dirty" >&2
+    exit 1
+}
 
 [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]] || {
     echo "trusted-publishing token is missing" >&2
     exit 1
 }
+
+bash "$release_script_dir/check-release-blockers.sh"
 
 set +e
 (
@@ -43,7 +70,7 @@ set -e
 
 for attempt in $(seq 1 30); do
     state_output=$(mktemp)
-    if GITHUB_OUTPUT="$state_output" scripts/release/registry-state.sh \
+    if GITHUB_OUTPUT="$state_output" "$release_script_dir/registry-state.sh" \
         "$package_name" "$version" "$candidate_crate" >/dev/null; then
         state=$(awk -F= '$1 == "state" { print $2 }' "$state_output")
         if [[ "$state" == exact ]]; then
