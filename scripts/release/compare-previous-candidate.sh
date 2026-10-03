@@ -81,7 +81,7 @@ if [[ -z "$previous_id" ]]; then
             printf '%s\n' "$logged_hashes" >>"$prior_hashes"
         done < <(jq -r '
             .[].jobs[] |
-            select(.name == "Package candidate") |
+            select(.name == "Package and attest candidate") |
             [
                 (.id | tostring),
                 ([.steps[]? |

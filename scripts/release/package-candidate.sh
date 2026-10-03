@@ -15,16 +15,15 @@
 
 set -euo pipefail
 
-[[ $# -eq 5 ]] || {
-    echo "usage: $0 MODE VERSION CANDIDATE_ID COMMIT_SHA OUTPUT_DIR" >&2
+[[ $# -eq 4 ]] || {
+    echo "usage: $0 VERSION RC_TAG COMMIT_SHA OUTPUT_DIR" >&2
     exit 2
 }
 
-release_mode=$1
-version=$2
-candidate_id=$3
-commit_sha=$4
-output_dir=$5
+version=$1
+rc_tag=$2
+commit_sha=$3
+output_dir=$4
 package_name=alternator-client
 release_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rust_version=${RUST_VERSION:-1.94.1}
@@ -43,36 +42,16 @@ scylla_versions=$(bash "$release_script_dir/release-policy.sh" scylla-versions)
     echo "invalid release version: $version" >&2
     exit 1
 }
-case "$release_mode" in
-    release)
-        rc_prefix="v$version-rc."
-        [[ "$candidate_id" == "$rc_prefix"* ]] || {
-            echo "invalid release candidate ID: $candidate_id" >&2
-            exit 1
-        }
-        rc_number=${candidate_id#"$rc_prefix"}
-        [[ "$rc_number" =~ ^[1-9][0-9]*$ ]] || {
-            echo "invalid release candidate ID: $candidate_id" >&2
-            exit 1
-        }
-        rc_tag=$candidate_id
-        ;;
-    validate)
-        [[ "${GITHUB_RUN_ID:-}" =~ ^[1-9][0-9]*$ ]] || {
-            echo "a numeric GITHUB_RUN_ID is required in validate mode" >&2
-            exit 1
-        }
-        [[ "$candidate_id" == "validation-$GITHUB_RUN_ID" ]] || {
-            echo "validation candidate ID must be validation-$GITHUB_RUN_ID" >&2
-            exit 1
-        }
-        rc_tag=
-        ;;
-    *)
-        echo "invalid release mode: $release_mode" >&2
-        exit 1
-        ;;
-esac
+rc_prefix="v$version-rc."
+[[ "$rc_tag" == "$rc_prefix"* ]] || {
+    echo "invalid RC tag: $rc_tag" >&2
+    exit 1
+}
+rc_number=${rc_tag#"$rc_prefix"}
+[[ "$rc_number" =~ ^[1-9][0-9]*$ ]] || {
+    echo "invalid RC tag: $rc_tag" >&2
+    exit 1
+}
 [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]] || {
     echo "invalid commit SHA: $commit_sha" >&2
     exit 1
@@ -155,8 +134,6 @@ rustdoc_host=$(awk -F': ' '$1 == "host" { print $2 }' <<<"$rustdoc_actual")
 jq -n \
     --arg package_name "$package_name" \
     --arg library_name alternator_driver \
-    --arg release_mode "$release_mode" \
-    --arg candidate_id "$candidate_id" \
     --arg version "$version" \
     --arg crate_file "$crate_file" \
     --arg crate_sha "$crate_sha" \
@@ -175,9 +152,7 @@ jq -n \
     --arg changelog_sha256 "$changelog_sha" \
     --arg source_date_epoch "$source_date_epoch" \
     '{
-        schema_version: 2,
-        release_mode: $release_mode,
-        candidate_id: $candidate_id,
+        schema_version: 1,
         crate: {
             name: $package_name,
             library_name: $library_name,
@@ -185,7 +160,7 @@ jq -n \
             file: $crate_file,
             sha256: $crate_sha
         },
-        rc_tag: (if $release_mode == "release" then $rc_tag else null end),
+        rc_tag: $rc_tag,
         commit_sha: $commit_sha,
         workflow_run_id: $workflow_run_id,
         toolchains: {
@@ -206,13 +181,7 @@ jq -n \
 )
 
 scripts/release/inspect-package.sh "$version" "$output_dir/$crate_file"
-scripts/release/verify-candidate.sh \
-    "$output_dir" \
-    "$(mktemp -d)" \
-    "$release_mode" \
-    "$version" \
-    "$candidate_id" \
-    "$commit_sha" >/dev/null
+scripts/release/verify-candidate.sh "$output_dir" "$(mktemp -d)" "$version" "$rc_tag" "$commit_sha" >/dev/null
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "crate_file=$crate_file" >>"$GITHUB_OUTPUT"
