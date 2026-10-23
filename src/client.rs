@@ -67,6 +67,30 @@ use aws_smithy_types::config_bag::ConfigBag;
 pub struct AlternatorClient {
     dynamodb_client: aws_sdk_dynamodb::Client,
     config: AlternatorConfig,
+    discovery: std::sync::Arc<ClientDiscovery>,
+}
+
+#[derive(Debug, Default)]
+struct ClientDiscovery {
+    topology: Vec<std::sync::Arc<LiveNodes>>,
+    partition_keys: Option<std::sync::Arc<keyrouting::resolver::PartitionKeyResolver>>,
+}
+
+impl ClientDiscovery {
+    fn stop(&self) {
+        for nodes in &self.topology {
+            nodes.tasks.stop();
+        }
+        if let Some(resolver) = &self.partition_keys {
+            resolver.tasks.stop();
+        }
+    }
+}
+
+impl Drop for ClientDiscovery {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Error returned when an [`AlternatorClient`] cannot be constructed safely.
@@ -528,12 +552,17 @@ impl AlternatorClient {
         {
             builder.set_endpoint_resolver(Some(SharedEndpointResolver::new(
                 AffinityDiscoveryEndpointResolver {
-                    inner: dynamodb_config.endpoint_resolver(),
+                    inner: {
+                        use aws_sdk_dynamodb::config::endpoint::ResolveEndpoint;
+                        aws_sdk_dynamodb::config::endpoint::DefaultResolver::new()
+                            .into_shared_resolver()
+                    },
                     affinity_nodes: affinity_nodes.clone(),
                 },
             )));
         }
 
+        let mut partition_keys = None;
         let routing_interceptor: Option<aws_sdk_dynamodb::config::SharedInterceptor> =
             match (live_nodes.as_ref(), affinity_config.as_ref()) {
                 (None, _) => None,
@@ -560,6 +589,7 @@ impl AlternatorClient {
                             pk_discovery_client,
                             cfg.pk_info_per_table.clone(),
                         ));
+                    partition_keys = Some(resolver.clone());
                     Some(aws_sdk_dynamodb::config::SharedInterceptor::new(
                         AffinityQueryPlanInterceptor::new(
                             cfg.clone(),
@@ -589,7 +619,30 @@ impl AlternatorClient {
         Ok(Self {
             dynamodb_client,
             config,
+            discovery: std::sync::Arc::new(ClientDiscovery {
+                topology: live_nodes.into_iter().chain(affinity_live_nodes).collect(),
+                partition_keys,
+            }),
         })
+    }
+
+    /// Stops and joins topology and partition-key discovery for this client
+    /// and every clone. Concurrent or repeated calls are safe, including after
+    /// a previous shutdown future was cancelled. New discovery stays disabled.
+    ///
+    /// This does not shut down the Tokio runtime or cancel user operations.
+    /// Operation builders remain usable with the last known topology and
+    /// cached partition keys. Dropping the last clone also stops discovery;
+    /// call this method when task completion must be awaited. Keep the runtimes
+    /// running discovery driven until this method returns.
+    pub async fn shutdown(&self) {
+        self.discovery.stop();
+        for nodes in &self.discovery.topology {
+            nodes.tasks.shutdown().await;
+        }
+        if let Some(resolver) = &self.discovery.partition_keys {
+            resolver.tasks.shutdown().await;
+        }
     }
 
     /// Returns the configuration used to construct this client.
