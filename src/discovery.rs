@@ -111,6 +111,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     struct Dropped(Arc<AtomicUsize>);
 
@@ -145,7 +147,9 @@ mod tests {
             }));
         }
         barrier.wait();
-        tasks.shutdown().await;
+        timeout(Duration::from_secs(1), tasks.shutdown())
+            .await
+            .expect("shutdown must join tasks racing registration");
         for spawner in spawners {
             spawner.join().unwrap();
         }
@@ -174,8 +178,14 @@ mod tests {
                 })
                 .is_none()
         );
-        tokio::join!(tasks.shutdown(), tasks.shutdown());
+        timeout(Duration::from_secs(1), async {
+            tokio::join!(tasks.shutdown(), tasks.shutdown());
+        })
+        .await
+        .expect("concurrent shutdown callers must join task cleanup");
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
-        tasks.shutdown().await;
+        timeout(Duration::from_secs(1), tasks.shutdown())
+            .await
+            .expect("completed shutdown must remain ready");
     }
 }

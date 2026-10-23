@@ -1651,6 +1651,7 @@ mod tests {
                 );
             builder.set_discovery_timeout(configured);
             let nodes = LiveNodes::new(&builder.build()).unwrap();
+            let started = tokio::time::Instant::now();
             let scan = tokio::spawn(async move {
                 nodes
                     .scan_topology_table(SYSTEM_LOCAL_TABLE, &nodes.seed_urls[0], None)
@@ -1674,7 +1675,20 @@ mod tests {
             );
             assert_eq!(http.dropped.available_permits(), 0);
             tokio::time::advance(effective - before_deadline).await;
-            assert!(scan.await.unwrap().is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), scan)
+                    .await
+                    .expect("topology scan must complete at its discovery deadline")
+                    .unwrap()
+                    .is_none()
+            );
+            let elapsed = started.elapsed();
+            // Awaiting the task may auto-advance paused time. Permit only the
+            // millisecond granularity of Tokio's timers beyond the deadline.
+            assert!(
+                elapsed <= effective + Duration::from_millis(1),
+                "topology scan exceeded discovery deadline: {elapsed:?} > {effective:?}"
+            );
             assert_eq!(http.dropped.available_permits(), 1);
             let settings = http.connect_timeouts.lock().unwrap();
             assert!(!settings.is_empty());
