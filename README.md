@@ -147,11 +147,34 @@ working seed can therefore discover nodes in every datacenter. With discovery
 enabled, data-plane requests are rewritten to discovered nodes after a routing
 target is selected.
 
-Topology discovery requires ScyllaDB 4.1 or newer. When Alternator authorization
-is enforced, the configured role also needs `SELECT` permission on
-`system.local` and `system.peers`; discovery uses the client's configured
+Topology discovery requires ScyllaDB 4.1 or newer and uses the client's configured
 credentials provider. A client that supplies credentials only as per-operation
 overrides cannot use those credentials for background discovery.
+
+When `alternator_enforce_authorization: true`, the role needs `SELECT` permission
+on both `system.local` and `system.peers`, in addition to its application-table
+permissions. For a least-privilege setup, have an administrator grant these
+table-scoped permissions before deploying the client:
+
+```cql
+GRANT SELECT ON TABLE system.local TO application_role;
+GRANT SELECT ON TABLE system.peers TO application_role;
+```
+
+Replace `application_role` with the application's actual role name. Applicable
+permissions inherited from other roles, grants on ancestor resources, or
+superuser status can already satisfy these checks. These grants expose the
+metadata tables to the role; they do not grant access to application tables.
+CQL's implicit read exemptions for these system tables do not apply to
+[Alternator's `Scan` authorization path](https://github.com/scylladb/scylladb/blob/0dbea6201d676548993bc5889d8f4a34dd6ef54c/alternator/executor.cc#L1015-L1056).
+When Alternator authorization is not enforced, these grants are not needed.
+
+If either scan is denied, discovery cannot publish a complete topology.
+Ordinary requests may continue through bootstrap seeds or the last published
+topology, so successful data requests alone do not demonstrate discovery or
+DC/rack locality. Rack-scoped affinity requests that need their first cross-rack
+topology can fail readiness until both permissions are available. The client
+does not grant permissions automatically.
 
 Use ScyllaDB 5.2 or newer when the node's bind and client-advertised addresses
 differ. Earlier releases can expose the bind address in
