@@ -1253,6 +1253,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct CapturedRequest {
+        requests: std::sync::Mutex<Vec<HttpRequest>>,
         calls: std::sync::atomic::AtomicUsize,
         authorization: std::sync::atomic::AtomicBool,
         amz_date: std::sync::atomic::AtomicBool,
@@ -1299,9 +1300,27 @@ mod tests {
                 request.headers().contains_key("x-amz-security-token"),
                 std::sync::atomic::Ordering::SeqCst,
             );
+            let response = if request
+                .headers()
+                .get("x-amz-target")
+                .is_some_and(|target| target.ends_with(".Scan"))
+            {
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body().bytes().unwrap()).unwrap();
+                match body["TableName"].as_str().unwrap() {
+                    ".scylla.alternator.system.local" => {
+                        r#"{"Items":[{"rpc_address":{"S":"127.0.0.1"},"data_center":{"S":"dc1"},"rack":{"S":"rack1"}}]}"#
+                    }
+                    ".scylla.alternator.system.peers" => r#"{"Items":[]}"#,
+                    table => panic!("unexpected topology table: {table}"),
+                }
+            } else {
+                r#"{"TableNames":[]}"#
+            };
+            self.0.requests.lock().unwrap().push(request);
             HttpConnectorFuture::ready(Ok(HttpResponse::new(
                 StatusCode::try_from(200).unwrap(),
-                SdkBody::from(r#"{"TableNames":[]}"#),
+                SdkBody::from(response),
             )))
         }
     }
@@ -1462,16 +1481,31 @@ mod tests {
         .expect("topology discovery should scan system.local and system.peers");
         drop(client);
 
-        assert!(
-            captured
-                .authorization
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
-        assert!(captured.amz_date.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(
-            captured
-                .security_token
-                .load(std::sync::atomic::Ordering::SeqCst)
+        let requests = captured.requests.lock().unwrap();
+        let tables: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                assert!(request.headers().contains_key("authorization"));
+                assert!(request.headers().contains_key("x-amz-date"));
+                assert!(request.headers().contains_key("x-amz-security-token"));
+                assert!(
+                    request
+                        .headers()
+                        .get("x-amz-target")
+                        .unwrap()
+                        .ends_with(".Scan")
+                );
+                let body: serde_json::Value =
+                    serde_json::from_slice(request.body().bytes().unwrap()).unwrap();
+                body["TableName"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                ".scylla.alternator.system.local",
+                ".scylla.alternator.system.peers"
+            ]
         );
     }
 

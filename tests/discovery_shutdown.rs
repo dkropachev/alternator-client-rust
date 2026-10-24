@@ -191,14 +191,19 @@ async fn shutdown_joins_partition_key_io_and_blocks_new_discovery() {
     assert_eq!(http.describes.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn last_client_drop_stops_discovery_but_dropping_one_clone_keeps_it_running() {
     let http = DiscoveryHttp::new(true, false);
     let client = http.client();
     let clone = client.clone();
     http.wait_entered().await;
     drop(client);
-    assert_eq!(http.dropped.available_permits(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), http.dropped.acquire())
+            .await
+            .is_err(),
+        "dropping one clone must keep in-flight discovery running"
+    );
     drop(clone);
     http.wait_dropped().await;
 }

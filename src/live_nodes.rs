@@ -1052,8 +1052,14 @@ mod tests {
         let nodes = LiveNodes::new(&test_config()).unwrap();
         let mut waiter = Box::pin(nodes.wait_for_initial_discovery());
         assert!(waiter.as_mut().now_or_never().is_none());
-        nodes.tasks.shutdown().await;
-        assert!(!waiter.await);
+        tokio::time::timeout(Duration::from_secs(1), nodes.tasks.shutdown())
+            .await
+            .expect("shutdown must join topology discovery");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("shutdown must release initial discovery waiters")
+        );
         nodes.ensure_discovery_started();
         assert!(!discovery_is_running(&nodes));
     }
@@ -1440,7 +1446,9 @@ mod tests {
                 ));
                 assert_eq!(nodes.tasks.active_task_count(), 1);
             }
-            nodes.tasks.shutdown().await;
+            tokio::time::timeout(Duration::from_secs(1), nodes.tasks.shutdown())
+                .await
+                .expect("shutdown must join discovery on its healthy owner");
         });
     }
 
